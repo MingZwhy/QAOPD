@@ -1,0 +1,25 @@
+# Local copy of lm_eval's siqa/siqa.yaml, differing ONLY in where the data comes
+# from. Upstream points at the `social_i_qa` hub dataset, which still ships a
+# loading script; datasets>=4 refuses those ("Dataset scripts are no longer
+# supported"), so the task dies at load time and takes the whole
+# EdgeRazor_Eval_QLLM group down with it. The rows here are the hub's own
+# auto-converted parquet (refs/convert/parquet), so the data is identical.
+task: social_iqa
+dataset_path: parquet
+dataset_kwargs:
+  data_files:
+    train: eval_tasks/social_iqa/train.parquet
+    validation: eval_tasks/social_iqa/validation.parquet
+output_type: multiple_choice
+training_split: train
+validation_split: validation
+doc_to_text: "Q: {{context}} {{question}}\nA:"
+target_delimiter: " "
+doc_to_choice: "{{[answerA, answerB, answerC]}}"
+doc_to_target: "{{ (label|int) - 1 }}"
+metric_list:
+  - metric: acc
+    aggregation: mean
+    higher_is_better: true
+metadata:
+  version: 0.0

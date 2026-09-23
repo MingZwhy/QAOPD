@@ -1,0 +1,29 @@
+# The nine short-form QA benchmarks the paper averages as QA9.
+#
+# This is eval_tasks/edgerazor_qa minus boolq, hendrycks_ethics and gsm8k.
+# Those three are dropped on purpose: gsm8k is reported separately as a
+# mathematics benchmark, and boolq/ethics are not part of the QA9 average.
+# social_iqa resolves through eval_tasks/social_iqa/, which carries a parquet
+# copy -- the hub version still ships a loading script and datasets>=4 refuses
+# it, which aborts the whole group.
+#
+# Usage:
+#   MODEL=<deployment export> TAG=<name> GPUS=0,1,2,3 QA_TASKS=qa9 \
+#     bash scripts/eval/qa_suite.sh
+group: qa9
+task:
+  - arc_easy
+  - arc_challenge
+  - hellaswag
+  - social_iqa
+  - openbookqa
+  - piqa
+  - winogrande
+  - truthfulqa_mc2
+  - mmlu
+# Deliberately no aggregate_metric_list. mmlu expands into its 57 subjects, so
+# any group-level mean would weight mmlu 57/65 instead of 1/9. QA9 counts mmlu
+# as one task, so the average is computed from the nine task-level rows by
+# tools/qa9_mean.py rather than by lm_eval.
+metadata:
+  version: 1.0

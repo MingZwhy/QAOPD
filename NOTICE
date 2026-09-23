@@ -1,0 +1,31 @@
+QAOPD
+Copyright 2026 The Authors
+
+This product includes software developed as part of the following projects.
+
+--------------------------------------------------------------------------------
+verl — https://github.com/volcengine/verl
+Copyright 2024-2026 Bytedance Ltd. and/or its affiliates
+Licensed under the Apache License, Version 2.0.
+
+Included as a git submodule at third_party/verl, pinned to commit
+bdfedd4617931e35f05c17c2c4954489efe68054. Modifications applied by this project
+are distributed as a patch at third_party/patches/verl-qaopd.patch; they add an
+EdgeRazor quantization backend under verl/utils/qat/, a teacher-forcing agent
+loop, and related configuration and worker changes.
+
+--------------------------------------------------------------------------------
+EdgeRazor — https://github.com/zhangsq-nju/EdgeRazor
+Licensed under the Apache License, Version 2.0.
+
+Included as a git submodule at third_party/edgerazor, pinned to commit
+f48a29987d737f2f83f13a58245ee055d300b2b7. Modifications applied by this project
+are distributed as a patch at third_party/patches/edgerazor-qaopd.patch; they
+add dynamic weight reload for on-policy rollouts and related quantization
+changes.
+
+--------------------------------------------------------------------------------
+Datasets and benchmarks referenced by this project (GSM8K, MATH, MATH-500,
+AMC23, MBPP, HumanEval, KodCode, DAPO-Math, and the QA suite) are distributed by
+their respective authors under their own licenses and are not redistributed
+here except where noted in eval_tasks/.

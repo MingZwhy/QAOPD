@@ -1,0 +1,1015 @@
+diff --git a/example/data-for-qllm/src/data_prepare.sh b/example/data-for-qllm/src/data_prepare.sh
+index e6f329a..bc0c7cf 100755
+--- a/example/data-for-qllm/src/data_prepare.sh
++++ b/example/data-for-qllm/src/data_prepare.sh
+@@ -366,7 +366,7 @@ generate_task_0_2M_instruct() {
+     echo "--- Generating task_0.2M_instruct.jsonl (Mixed Downstream Dataset, ~0.2M) ---"
+ 
+     python - <<'PYEOF'
+-import json, os, re, random
++import json, os, re, random, time
+ from pathlib import Path
+ from datasets import load_dataset
+ from jinja2 import Template
+@@ -600,12 +600,58 @@ output_dir = os.environ.get("OUTPUT_DIR", ".")
+ processed_dir = os.path.join(output_dir, "processed")
+ Path(processed_dir).mkdir(parents=True, exist_ok=True)
+ 
++# QAOPD patch. Four of the sources above are named by their old canonical id,
++# which the hub has since retired: a bare name is no longer a valid repo id
++# ("Repository id must be 'namespace/name'"), so those entries fail before any
++# parquet fallback can help. Each target below holds the same rows under the
++# same column names as the retired id did -- verified against the row counts
++# this script prints (boolq 9,427; winogrande 40,398; siqa 33,410;
++# openbookqa 4,957).
++CANONICAL_RENAMES = {
++    "super_glue":  "aps/super_glue",
++    "winogrande":  "allenai/winogrande",
++    "social_i_qa": "lighteval/siqa",
++    "openbookqa":  "allenai/openbookqa",
++}
++
++
++def _load_with_parquet_fallback(path, name):
++    """QAOPD patch. Several sources here (EleutherAI/hendrycks_ethics and the
++    renamed ones above) are still script-based datasets, and datasets>=4 refuses
++    to run those, so this loop dies on its first entry. Every hub dataset has an
++    auto-converted parquet branch holding the same rows; fall back to it.
++    Sub-configs live as directories there, so `name` becomes `data_dir`.
++
++    The fallback catches everything rather than the script error specifically:
++    when the hub rate-limits us (which it does, readily), datasets silently
++    switches to cache-only mode and the failure surfaces as an unrelated
++    ValueError about a missing cache entry."""
++    path = CANONICAL_RENAMES.get(path, path)
++    rev = "refs/convert/parquet"
++    attempts = [
++        lambda: load_dataset(path, name) if name else load_dataset(path),
++        lambda: load_dataset(path, name, revision=rev) if name else load_dataset(path, revision=rev),
++        lambda: load_dataset(path, data_dir=name, revision=rev),
++    ]
++    last = None
++    for attempt in attempts:
++        for wait in (0, 20, 60):
++            if wait:
++                time.sleep(wait)
++            try:
++                return attempt()
++            except Exception as e:
++                last = e
++                # Only a rate limit is worth waiting out; anything else means
++                # this attempt is simply wrong, so move to the next one.
++                if "429" not in str(e) and "Too Many Requests" not in str(e):
++                    break
++    raise RuntimeError(f"could not load {path}/{name}: {type(last).__name__}: {last}")
++
++
+ for task_name, config in DATASET_CONFIGS.items():
+     print(f"  Processing {task_name} ...")
+-    if config["dataset_name"]:
+-        dataset = load_dataset(config["dataset_path"], config["dataset_name"])
+-    else:
+-        dataset = load_dataset(config["dataset_path"])
++    dataset = _load_with_parquet_fallback(config["dataset_path"], config["dataset_name"])
+ 
+     process_docs_fn = config.get("process_docs")
+     split_name = config.get("training_split")
+diff --git a/example/edgerazor-llm/src/convert/convert_qweight.py b/example/edgerazor-llm/src/convert/convert_qweight.py
+index 5e830a6..ce948d6 100644
+--- a/example/edgerazor-llm/src/convert/convert_qweight.py
++++ b/example/edgerazor-llm/src/convert/convert_qweight.py
+@@ -14,6 +14,7 @@ Usage:
+ """
+ 
+ import argparse
++import json
+ import os
+ import shutil
+ import sys
+@@ -80,6 +81,47 @@ def get_torch_dtype(dtype_str: str) -> torch.dtype:
+     return dtype_map.get(dtype_str, torch.bfloat16)
+ 
+ 
++def assert_unquantized_source(model_path: str):
++    """Refuse deployment weights that would otherwise be quantized twice."""
++    config_path = Path(model_path) / "config.json"
++    if not config_path.is_file():
++        raise FileNotFoundError(f"Model config not found: {config_path}")
++    with config_path.open(encoding="utf-8") as handle:
++        config = json.load(handle)
++
++    evidence = []
++    quantization_config = config.get("quantization_config")
++    if isinstance(quantization_config, dict) and quantization_config.get(
++        "is_w_quantized"
++    ) is True:
++        evidence.append("quantization_config.is_w_quantized=true")
++
++    edgerazor_config = config.get("edgerazor_config")
++    if isinstance(edgerazor_config, dict):
++        qat_config = edgerazor_config.get("qat_configuration", edgerazor_config)
++        if isinstance(qat_config, dict):
++            function = qat_config.get("function")
++            if isinstance(function, dict) and function.get("is_w_quantized") is True:
++                evidence.append(
++                    "edgerazor_config.qat_configuration.function.is_w_quantized=true"
++                )
++
++    if evidence:
++        details = ", ".join(evidence)
++        raise ValueError(
++            f"{model_path} contains prequantized deployment weights ({details}). "
++            "convert_qweight.py requires latent weights and is not idempotent on "
++            "already quantized weights."
++        )
++
++
++
++    weights_path = Path(model_path) / "model.safetensors"
++    if weights_path.is_symlink():
++        weight_source = weights_path.resolve().parent
++        if weight_source != Path(model_path).resolve():
++            assert_unquantized_source(str(weight_source))
++
+ def load_model(model_path: str, dtype: torch.dtype, device: str, trust_remote_code: bool):
+     """Load model from path."""
+     print(f"Loading model from: {model_path}")
+@@ -193,6 +235,7 @@ def main():
+     
+     # Convert dtype string to torch.dtype
+     torch_dtype = get_torch_dtype(args.dtype)
++    assert_unquantized_source(args.unquantized_model)
+     
+     # Step 1: Load unquantized model
+     model = load_model(
+diff --git a/example/edgerazor-llm/src/dataset.py b/example/edgerazor-llm/src/dataset.py
+index 9a179d3..42d3781 100644
+--- a/example/edgerazor-llm/src/dataset.py
++++ b/example/edgerazor-llm/src/dataset.py
+@@ -3,6 +3,7 @@ Dataset module for Qwen3-EdgeRazor.
+ """
+ # ruff: noqa: F401
+ 
++import os
+ import torch
+ from datasets import load_dataset
+ from torch.utils.data import Dataset
+@@ -73,6 +74,13 @@ class ReasoningDataset(Dataset):
+             raw_dataset = load_dataset(dataset_path)
+         print(f"Dataset loaded: {dataset_path}, total samples: {len(raw_dataset[split])}")
+ 
++        # QAOPD patch: upstream never assigns self.dataset. Every branch above
++        # builds `raw_dataset` and drops it, so __len__ and __getitem__ raise
++        # AttributeError and this class cannot train as shipped -- including the
++        # limit_num_samples branch below, which reads self.dataset before it
++        # would ever have been set.
++        self.dataset = raw_dataset[split]
++
+         if limit_num_samples is not None and limit_num_samples > 0:
+             original_size = len(self.dataset)
+             if limit_num_samples < original_size:
+@@ -92,6 +100,44 @@ class ReasoningDataset(Dataset):
+         item = self.dataset[index]
+         messages = item['messages']
+ 
++        # ER_PLAIN_TEXT=1 skips the chat template and concatenates the user and
++        # assistant turns into one plain-text sequence.
++        #
++        # Why it exists: OPD on the Qwen line trains on a plain-text protocol and
++        # every historical evaluation uses plain as well, but this loader defaults
++        # to apply_chat_template. A QAD control arm trained through it therefore
++        # emits conversational output that the plain protocol cannot parse -- four
++        # arms measured GSM8K 23-44 falling to 0-3, which looks like a broken model
++        # and is only a protocol mismatch (the same checkpoint scores 27.90 under
++        # the chat protocol). Switching the evaluation to chat instead mismeasures
++        # the QAD starting point, which on 0.6B reads 4.32 under chat against 23.05
++        # under plain. Neither protocol fits both ends. Training in plain text lets
++        # the whole pipeline stay on plain, so the start and the end are comparable.
++        #
++        # Off by default: every existing QAD checkpoint was trained with the
++        # template, and flipping the default would make old and new incomparable.
++        if os.environ.get("ER_PLAIN_TEXT") == "1":
++            user = "".join(m["content"] for m in messages if m.get("role") == "user")
++            asst = "".join(m["content"] for m in messages if m.get("role") == "assistant")
++            prev_ids = self.tokenizer.encode(user, add_special_tokens=False)
++            input_ids = self.tokenizer.encode(user + asst, add_special_tokens=False)
++            labels = [ignore_id] * len(input_ids)
++            for pos in range(len(prev_ids), len(input_ids)):
++                labels[pos] = input_ids[pos]
++            if len(input_ids) > self.max_seq_len - 1:
++                input_ids = input_ids[:self.max_seq_len - 1]
++                labels = labels[:self.max_seq_len - 1]
++            input_ids.append(self.eos_token_id)
++            labels.append(self.eos_token_id)
++            attention_mask = [1] * len(input_ids)
++            # Return tensors, matching the default branch below. Returning lists
++            # blows up in the collator.
++            return {
++                "input_ids": torch.tensor(input_ids),
++                "attention_mask": torch.tensor(attention_mask),
++                "labels": torch.tensor(labels),
++            }
++
+         if self.add_system_prompt:
+             conversation = [{
+                 "role": "system",
+diff --git a/example/edgerazor-llm/src/main.py b/example/edgerazor-llm/src/main.py
+index 669576c..a7bfa68 100644
+--- a/example/edgerazor-llm/src/main.py
++++ b/example/edgerazor-llm/src/main.py
+@@ -127,7 +127,13 @@ if __name__ == "__main__":
+ 
+         save_strategy=config.save_strategy,
+         save_steps=config.save_steps,
+-        save_total_limit=20,
++        # Upstream pins this to 20. When max_steps is raised for a continuation
++        # run the early checkpoints get deleted, and those are exactly the ones a
++        # checkpoint scan may have picked as the OPD starting point.
++        save_total_limit=(
++            None if os.environ.get("ER_SAVE_TOTAL_LIMIT") == "0"
++            else int(os.environ.get("ER_SAVE_TOTAL_LIMIT", 20))
++        ),
+         save_safetensors=True,
+ 
+         logging_steps=1,
+@@ -193,7 +199,15 @@ if __name__ == "__main__":
+     print(f"  - Total steps: {total_steps}")
+     print(f"  - TensorBoard logs: {args.logging_dir}")
+ 
+-    trainer.train(resume_from_checkpoint=False)
++    # ER_RESUME=1 continues from the newest checkpoint in output_dir, or name a
++    # checkpoint directory explicitly. Needed to raise max_steps on a run that is
++    # still climbing; the schedule is constant_with_warmup, so extending it does
++    # not create a discontinuity.
++    resume = os.environ.get("ER_RESUME", "")
++    resume = True if resume == "1" else (resume or False)
++    print(f"  - Resume from checkpoint: {resume}")
++
++    trainer.train(resume_from_checkpoint=resume)
+ 
+     trainer.model.to(torch.bfloat16)
+     trainer.save_model(config.final_model)
+diff --git a/example/edgerazor-llm/src/trainer.py b/example/edgerazor-llm/src/trainer.py
+index 4e0118d..bcc5bc6 100644
+--- a/example/edgerazor-llm/src/trainer.py
++++ b/example/edgerazor-llm/src/trainer.py
+@@ -51,6 +51,9 @@ class EdgeRazorTrainer(Trainer):
+         self.edgerazor = edgerazor
+         
+         self.custom_losses = {}
++        # Running sums of the loss components over one logging window; see log().
++        self._loss_sums: dict[str, float] = {}
++        self._loss_count = 0
+     
+     def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
+         # inputs contains: input_ids, attention_mask, labels
+@@ -118,8 +121,22 @@ class EdgeRazorTrainer(Trainer):
+                 'train/router_z_loss': router_z_loss.item() if isinstance(router_z_loss, torch.Tensor) else router_z_loss,
+             })
+         
++        # QAOPD patch: accumulate the components over the logging window.
++        # compute_loss runs once per micro-step, so self.custom_losses only ever
++        # held the last micro-batch of a gradient-accumulation group. With
++        # accumulation at 8 or 16 that made every component curve a single
++        # noisy sample, while HF's own `loss` is the mean of the whole group --
++        # the two disagreed and only `loss` was trustworthy.
++        for key, value in self.custom_losses.items():
++            self._loss_sums[key] = self._loss_sums.get(key, 0.0) + value
++        self._loss_count += 1
++
+         return (loss_total, student_outputs) if return_outputs else loss_total
+-    
++
+     def log(self, logs: dict[str, float], start_time: Optional[float] = None) -> None:
+-        logs.update(self.custom_losses)
++        if self._loss_count:
++            logs.update({k: v / self._loss_count for k, v in self._loss_sums.items()})
++            self._loss_sums, self._loss_count = {}, 0
++        else:
++            logs.update(self.custom_losses)
+         super().log(logs, start_time)
+diff --git a/src/edgerazor/edgerazor.py b/src/edgerazor/edgerazor.py
+index 9ae9f91..be851e1 100644
+--- a/src/edgerazor/edgerazor.py
++++ b/src/edgerazor/edgerazor.py
+@@ -140,7 +140,7 @@ class EdgeRazor:
+             self.model = model
+         return self.model
+ 
+-    def create_kv_cache(self, model_config=None):
++    def create_kv_cache(self, model_config=None, cache=None):
+         """Create a QuantizedKVState for KV cache quantization if configured.
+ 
+         Returns None when QAT is disabled or kv_cache is not selected.
+@@ -150,10 +150,11 @@ class EdgeRazor:
+         Args:
+             model_config: Optional PretrainedConfig for DynamicCache so
+                 sliding-window and hybrid layers are handled correctly.
++            cache: Optional existing transformers Cache to wrap.
+         """
+         if self.qat is None:
+             return None
+-        return self.qat.create_kv_cache(model_config=model_config)
++        return self.qat.create_kv_cache(model_config=model_config, cache=cache)
+ 
+     def compute_loss(
+         self,
+diff --git a/src/edgerazor/qat/block/qkv_cache.py b/src/edgerazor/qat/block/qkv_cache.py
+index 763cd9a..02dd9cd 100644
+--- a/src/edgerazor/qat/block/qkv_cache.py
++++ b/src/edgerazor/qat/block/qkv_cache.py
+@@ -81,6 +81,7 @@ class QuantizedKVState:
+ def create_quantized_kv_cache(
+     config: QuantConfig,
+     model_config=None,
++    cache: Cache | None = None,
+ ) -> QuantizedKVState | None:
+     """Create a QuantizedKVState from a QuantConfig if KV cache quant is configured.
+ 
+@@ -88,6 +89,8 @@ def create_quantized_kv_cache(
+         config: QuantConfig with kv_cache_function settings.
+         model_config: Optional PretrainedConfig for DynamicCache so sliding-window
+             and hybrid layers are handled correctly. Pass the model's config here.
++        cache: Optional existing transformers Cache to wrap. Generation APIs often
++            allocate this cache before the first model forward.
+ 
+     Returns None if kv_cache_function is not set.
+     """
+@@ -111,8 +114,16 @@ def create_quantized_kv_cache(
+     if config.function.kv_mixed_precision_prop > 0:
+         kv_kwargs['mixed_precision_prop'] = config.function.kv_mixed_precision_prop
+ 
++    if cache is None:
++        cache = DynamicCache(config=model_config)
++    elif not isinstance(cache, Cache):
++        raise TypeError(
++            "cache must be a transformers Cache instance, "
++            f"got {type(cache).__name__}"
++        )
++
+     return QuantizedKVState(
+-        cache=DynamicCache(config=model_config),
++        cache=cache,
+         quant_fn=kv_cache_function,
+         kv_kwargs=kv_kwargs,
+     )
+diff --git a/src/edgerazor/qat/module/qembedding.py b/src/edgerazor/qat/module/qembedding.py
+index 98961d7..1cc6a13 100644
+--- a/src/edgerazor/qat/module/qembedding.py
++++ b/src/edgerazor/qat/module/qembedding.py
+@@ -106,7 +106,8 @@ def copy_embedding_to_qembedding(
+         quant_config=quant_config
+     )
+     # Copy weights
+-    qembedding.weight.data = embedding.weight.data.clone()
++    if embedding.weight.device.type != "meta":
++        qembedding.weight.data = embedding.weight.data.clone()
+     # Copy state
+     qembedding.training = embedding.training
+     return qembedding
+diff --git a/src/edgerazor/qat/module/qlinear.py b/src/edgerazor/qat/module/qlinear.py
+index f1a794e..d81d07e 100644
+--- a/src/edgerazor/qat/module/qlinear.py
++++ b/src/edgerazor/qat/module/qlinear.py
+@@ -109,9 +109,10 @@ def copy_linear_to_qlinear(
+         quant_config=quant_config
+     )
+     # Copy weights and bias
+-    qlinear.weight.data = linear.weight.data.clone()
+-    if linear.bias is not None:
+-        qlinear.bias.data = linear.bias.data.clone()
++    if linear.weight.device.type != "meta":
++        qlinear.weight.data = linear.weight.data.clone()
++        if linear.bias is not None:
++            qlinear.bias.data = linear.bias.data.clone()
+     # Copy state
+     qlinear.training = linear.training
+     return qlinear
+diff --git a/src/edgerazor/qat/qat.py b/src/edgerazor/qat/qat.py
+index 7bcde18..6f418e1 100644
+--- a/src/edgerazor/qat/qat.py
++++ b/src/edgerazor/qat/qat.py
+@@ -399,7 +399,7 @@ class QAT:
+ 
+         return updated_model
+ 
+-    def create_kv_cache(self, model_config=None):
++    def create_kv_cache(self, model_config=None, cache=None):
+         """Create a QuantizedKVState for KV cache quantization if configured.
+ 
+         Returns None when kv_cache is not enabled in the select configuration.
+@@ -409,7 +409,12 @@ class QAT:
+         Args:
+             model_config: Optional PretrainedConfig for DynamicCache so
+                 sliding-window and hybrid layers are handled correctly.
++            cache: Optional existing transformers Cache to wrap.
+         """
+         if not self.selector.has_kv_cache:
+             return None
+-        return create_quantized_kv_cache(self.config, model_config=model_config)
++        return create_quantized_kv_cache(
++            self.config,
++            model_config=model_config,
++            cache=cache,
++        )
+diff --git a/src/edgerazor/templates/modeling_edgerazor.py b/src/edgerazor/templates/modeling_edgerazor.py
+index 6a37c80..2a139b6 100644
+--- a/src/edgerazor/templates/modeling_edgerazor.py
++++ b/src/edgerazor/templates/modeling_edgerazor.py
+@@ -20,6 +20,8 @@ Then load as:
+         "XXX-EdgeRazor", trust_remote_code=True
+     )
+ """
++from functools import wraps
++
+ from transformers import AutoConfig, AutoModelForCausalLM
+ 
+ 
+@@ -126,9 +128,18 @@ def _inject_kv_cache(model, edgerazor):
+ 
+     _original_forward = model.forward
+ 
++    @wraps(_original_forward)
+     def _forward(*args, **kwargs):
+-        if kwargs.get('past_key_values') is None and kwargs.get('use_cache', True):
+-            kv_cache = edgerazor.create_kv_cache(model_config=model.config)
++        if kwargs.get('use_cache', True):
++            from edgerazor.qat.block.qkv_cache import QuantizedKVState
++
++            existing_cache = kwargs.get('past_key_values')
++            if isinstance(existing_cache, QuantizedKVState):
++                return _original_forward(*args, **kwargs)
++            kv_cache = edgerazor.create_kv_cache(
++                model_config=model.config,
++                cache=existing_cache,
++            )
+             if kv_cache is not None:
+                 kwargs['past_key_values'] = kv_cache
+         return _original_forward(*args, **kwargs)
+diff --git a/src/edgerazor/vllm/__init__.py b/src/edgerazor/vllm/__init__.py
+index 51b3e08..8b1e3fd 100644
+--- a/src/edgerazor/vllm/__init__.py
++++ b/src/edgerazor/vllm/__init__.py
+@@ -52,6 +52,7 @@ __all__ = [
+     "INT1_58_MAX", "INT4_MAX", "INT8_MAX",
+     # Plugin
+     "register", "EdgeRazorConfig",
++    "prepare_for_weight_reload", "process_weights_after_loading",
+ ]
+ 
+ # ── vLLM-dependent classes — lazy import via register() ─────────
+@@ -59,6 +60,18 @@ __all__ = [
+ EdgeRazorConfig = None  # type: ignore[assignment]
+ 
+ 
++def prepare_for_weight_reload(model, device=None) -> int:
++    from .dynamic_reload import prepare_for_weight_reload as _prepare
++
++    return _prepare(model, device=device)
++
++
++def process_weights_after_loading(model) -> int:
++    from .dynamic_reload import process_weights_after_loading as _process
++
++    return _process(model)
++
++
+ def register() -> bool:
+     """Plugin entry point for vLLM auto-discovery (``vllm.general_plugins``).
+ 
+diff --git a/src/edgerazor/vllm/dynamic_reload.py b/src/edgerazor/vllm/dynamic_reload.py
+new file mode 100644
+index 0000000..7c1d139
+--- /dev/null
++++ b/src/edgerazor/vllm/dynamic_reload.py
+@@ -0,0 +1,124 @@
++"""Helpers for reloading latent weights into an EdgeRazor vLLM model."""
++
++from __future__ import annotations
++
++from typing import Any
++
++import torch
++from vllm.model_executor.utils import set_weight_attrs
++
++
++_PACKED_PARAMETERS = (
++    "qweight",
++    "qweight_scale",
++    "qweight_int4",
++    "qweight_int2",
++    "qweight_scale_int4",
++    "qweight_scale_int2",
++)
++_PACKED_BUFFERS = ("_edgerazor_inverse_perm",)
++
++
++def cache_weight_metadata(
++    layer: torch.nn.Module,
++    weight: torch.nn.Parameter,
++    weight_loader: Any,
++    extra_weight_attrs: dict[str, Any],
++) -> None:
++    """Remember enough metadata to recreate vLLM's raw HF weight parameter."""
++    layer._edgerazor_weight_meta = {
++        "shape": tuple(weight.shape),
++        "dtype": weight.dtype,
++        "input_dim": getattr(weight, "input_dim", 1),
++        "output_dim": getattr(weight, "output_dim", 0),
++        "weight_loader": weight_loader,
++        "extra_weight_attrs": dict(extra_weight_attrs),
++    }
++
++
++def _delete_tensor(layer: torch.nn.Module, name: str) -> None:
++    if name in layer._parameters or name in layer._buffers:
++        delattr(layer, name)
++
++
++def _retie_lm_head(model: torch.nn.Module, prepared: set[int]) -> bool:
++    """Re-share the embedding parameter with a tied lm_head.
++
++    vLLM's llama.py keeps lm_head as its own module that merely shares the
++    embedding's weight tensor, then tells the loader to skip "lm_head." because
++    the two are tied. Rebuilding each layer's raw parameter independently severs
++    that sharing, so lm_head keeps the uninitialized tensor forever and the model
++    emits uniform-random logits. qwen3.py aliases the whole module instead, which
++    is why only Llama-shaped models hit this.
++    """
++    from vllm.model_executor.layers.vocab_parallel_embedding import (
++        VocabParallelEmbedding,
++    )
++
++    if not getattr(getattr(model, "config", None), "tie_word_embeddings", False):
++        return False
++    lm_head = getattr(model, "lm_head", None)
++    if lm_head is None or id(lm_head) not in prepared:
++        return False
++    # ParallelLMHead subclasses VocabParallelEmbedding, so an exact type match
++    # picks out the input embedding and never the head itself.
++    embeds = [m for m in model.modules()
++              if type(m) is VocabParallelEmbedding and id(m) in prepared]
++    if len(embeds) != 1:
++        return False
++    embed = embeds[0]
++    if lm_head is embed or lm_head.weight.shape != embed.weight.shape:
++        return False
++    lm_head.register_parameter("weight", embed.weight)
++    return True
++
++
++def prepare_for_weight_reload(model: torch.nn.Module, device=None) -> int:
++    """Replace packed tensors with raw parameters accepted by model.load_weights."""
++    from vllm.model_executor.parameter import ModelWeightParameter
++
++    prepared = 0
++    prepared_ids: set[int] = set()
++    for layer in model.modules():
++        meta = getattr(layer, "_edgerazor_weight_meta", None)
++        if meta is None:
++            continue
++
++        for name in _PACKED_PARAMETERS:
++            _delete_tensor(layer, name)
++        for name in _PACKED_BUFFERS:
++            _delete_tensor(layer, name)
++        _delete_tensor(layer, "weight")
++
++        target_device = device
++        if target_device is None:
++            target_device = next(layer.parameters(), torch.empty(0)).device
++        data = torch.empty(meta["shape"], dtype=meta["dtype"], device=target_device)
++        weight = ModelWeightParameter(
++            data=data,
++            input_dim=meta["input_dim"],
++            output_dim=meta["output_dim"],
++            weight_loader=meta["weight_loader"],
++        )
++        layer.register_parameter("weight", weight)
++        set_weight_attrs(weight, meta["extra_weight_attrs"])
++        layer._edgerazor_needs_pack = True
++        prepared_ids.add(id(layer))
++        prepared += 1
++
++    _retie_lm_head(model, prepared_ids)
++    return prepared
++
++
++def process_weights_after_loading(model: torch.nn.Module) -> int:
++    """Pack every reloaded EdgeRazor layer after all weight buckets arrive."""
++    processed = 0
++    for layer in model.modules():
++        if not getattr(layer, "_edgerazor_needs_pack", False):
++            continue
++        quant_method = getattr(layer, "quant_method", None)
++        if quant_method is None or not hasattr(quant_method, "process_weights_after_loading"):
++            continue
++        quant_method.process_weights_after_loading(layer)
++        processed += 1
++    return processed
+diff --git a/src/edgerazor/vllm/edgerazor_quant.py b/src/edgerazor/vllm/edgerazor_quant.py
+index 0b7bc6f..69ea60f 100644
+--- a/src/edgerazor/vllm/edgerazor_quant.py
++++ b/src/edgerazor/vllm/edgerazor_quant.py
+@@ -74,6 +74,7 @@ class EdgeRazorConfig(QuantizationConfig):
+ 
+         # ── resolve quant_mode ─────────────────────────────────
+         if quant_mode:
++            requested_kv_cache_bits = kv_cache_bits
+             self._quant_mode_cfg: _QuantModeConfig | None = _QuantModeConfig(
+                 quant_mode,
+                 weight_bits_override=weight_bits,
+@@ -81,7 +82,11 @@ class EdgeRazorConfig(QuantizationConfig):
+             )
+             weight_bits = self._quant_mode_cfg.weight_bits
+             activation_bits = self._quant_mode_cfg.activation_bits
+-            kv_cache_bits = self._quant_mode_cfg.kv_cache_bits
++            kv_cache_bits = (
++                requested_kv_cache_bits
++                if requested_kv_cache_bits is not None
++                else self._quant_mode_cfg.kv_cache_bits
++            )
+             modules_to_not_convert = modules_to_not_convert or (
+                 self._quant_mode_cfg.exclude_names
+             )
+@@ -154,7 +159,7 @@ class EdgeRazorConfig(QuantizationConfig):
+         wbits_label = "1.58" if self.weight_bits == 1.58 else str(self.weight_bits)
+         logger.info(
+             "[EdgeRazor] Quantization config created: "
+-            "weight_bits=%s, activation_bits=%d, kv_cache_bits=%d, "
++            "weight_bits=%s, activation_bits=%d, kv_cache_bits=%s, "
+             "weight_block_size=%s, quant_mode=%s",
+             wbits_label,
+             self.activation_bits,
+@@ -427,6 +432,18 @@ class EdgeRazorConfig(QuantizationConfig):
+             UnquantizedEmbeddingMethod,
+         )
+ 
++        # vLLM's llama.py builds VocabParallelEmbedding without the ``prefix``
++        # kwarg that qwen2.py passes, so the layer arrives here unnamed and every
++        # name-based rule (".*embed_tokens" overrides, the skip-embedding default)
++        # silently misses. The layer type already says what this is, so recover
++        # the canonical name rather than resolving rules against an empty string.
++        if "embed_tokens" not in prefix and not prefix.endswith("lm_head"):
++            prefix = (
++                "model.embed_tokens"
++                if type(layer) is VocabParallelEmbedding
++                else "lm_head"
++            )
++
+         if not self._is_layer_quantized(prefix):
+             return UnquantizedEmbeddingMethod()
+ 
+diff --git a/src/edgerazor/vllm/embedding.py b/src/edgerazor/vllm/embedding.py
+index ec03c74..20e41ef 100644
+--- a/src/edgerazor/vllm/embedding.py
++++ b/src/edgerazor/vllm/embedding.py
+@@ -19,6 +19,7 @@ from .quant_ops import (
+     quantize_weight_per_block_int2,
+     quantize_weight_per_block_int4,
+ )
++from .dynamic_reload import cache_weight_metadata
+ 
+ logger = init_logger("vllm.edgerazor.embed")
+ 
+@@ -61,6 +62,7 @@ class EdgeRazorEmbeddingMethod(QuantizeMethodBase):
+         )
+         layer.register_parameter("weight", weight)
+         set_weight_attrs(weight, extra_weight_attrs)
++        cache_weight_metadata(layer, weight, weight_loader, extra_weight_attrs)
+ 
+         layer._edgerazor_needs_pack = True
+ 
+diff --git a/src/edgerazor/vllm/linear_py.py b/src/edgerazor/vllm/linear_py.py
+index b80e052..262c1ea 100644
+--- a/src/edgerazor/vllm/linear_py.py
++++ b/src/edgerazor/vllm/linear_py.py
+@@ -23,6 +23,7 @@ from .quant_ops import (
+     quantize_weight_per_block_int2,
+     quantize_weight_per_block_int4,
+ )
++from .dynamic_reload import cache_weight_metadata
+ 
+ logger = init_logger("vllm.edgerazor.py")
+ 
+@@ -67,6 +68,7 @@ class EdgeRazorPyLinearMethod(LinearMethodBase):
+         )
+         layer.register_parameter("weight", weight)
+         set_weight_attrs(weight, extra_weight_attrs)
++        cache_weight_metadata(layer, weight, weight_loader, extra_weight_attrs)
+ 
+         layer._edgerazor_needs_pack = True
+ 
+@@ -180,6 +182,7 @@ class EdgeRazorPyMixedPrecisionLinearMethod(LinearMethodBase):
+         )
+         layer.register_parameter("weight", weight)
+         set_weight_attrs(weight, extra_weight_attrs)
++        cache_weight_metadata(layer, weight, weight_loader, extra_weight_attrs)
+         layer._edgerazor_needs_pack = True
+ 
+     # ── pack ─────────────────────────────────────────────────────
+diff --git a/src/edgerazor/vllm/quant_mode_parse.py b/src/edgerazor/vllm/quant_mode_parse.py
+index 6ac2a9f..b158b6e 100644
+--- a/src/edgerazor/vllm/quant_mode_parse.py
++++ b/src/edgerazor/vllm/quant_mode_parse.py
+@@ -108,6 +108,9 @@ class QuantModeConfig:
+         # base bit-width from the main weight function
+         w_func = func_cfg.get("weight_function", "")
+         self._base_weight_bits = _extract_weight_bits(w_func)
++        mixed_prop = float(func_cfg.get("w_mixed_precision_prop", -1.0))
++        if "_mp_" in w_func and mixed_prop > 0:
++            self._base_weight_bits = round(1.58 * (1.0 - mixed_prop) + 4.0 * mixed_prop, 2)
+         self._base_activation_bits = _extract_activation_bits(
+             func_cfg.get("activation_function", "")
+         )
+diff --git a/src/edgerazor/vllm/quant_ops.py b/src/edgerazor/vllm/quant_ops.py
+index e23dc7d..5640226 100644
+--- a/src/edgerazor/vllm/quant_ops.py
++++ b/src/edgerazor/vllm/quant_ops.py
+@@ -370,7 +370,7 @@ def quantize_activation_per_block_int8(
+ # ──────────────────────────────────────────────
+ # Super-group = 8 output channels.
+ #   1.88-bit:  row % 8 == 0      → INT4,  rest → INT2 (ternary)
+-#   2.79-bit:  row % 8 <  4      → INT4,  rest → INT2 (ternary)
++#   2.79-bit:  row % 2 == 0      → INT4,  rest → INT2 (ternary)
+ # Solution: dual qweight tensors + row-mask interleaving.
+ 
+ SUPER_GROUP_SIZE = 8
+@@ -390,7 +390,9 @@ def _mixed_row_mask(N: int, bits: float, device: torch.device | None = None) ->
+     if bits == 1.88:
+         return torch.arange(N, device=device) % SUPER_GROUP_SIZE == 0
+     elif bits == 2.79:
+-        return (torch.arange(N, device=device) % SUPER_GROUP_SIZE) < 4
++        # Match QAT's static_row_wise_sparse rule with
++        # mixed_precision_prop=0.5: every second row is INT4.
++        return torch.arange(N, device=device) % 2 == 0
+     else:
+         raise ValueError(f"Unsupported mixed-precision bits={bits}")
+ 
+diff --git a/tests/integration/test_modeling_edgerazor_kv_generation.py b/tests/integration/test_modeling_edgerazor_kv_generation.py
+new file mode 100644
+index 0000000..8838a91
+--- /dev/null
++++ b/tests/integration/test_modeling_edgerazor_kv_generation.py
+@@ -0,0 +1,55 @@
++"""Regression coverage for KV quantization during Transformers generation."""
++
++from types import SimpleNamespace
++
++import torch
++from transformers import Qwen3Config, Qwen3ForCausalLM
++from transformers.cache_utils import DynamicCache
++
++from edgerazor.qat.block.qkv_cache import QuantizedKVState
++from edgerazor.templates.modeling_edgerazor import _inject_kv_cache
++
++
++def test_qwen3_generate_wraps_preallocated_dynamic_cache():
++    config = Qwen3Config(
++        vocab_size=128,
++        hidden_size=64,
++        intermediate_size=128,
++        num_hidden_layers=2,
++        num_attention_heads=4,
++        num_key_value_heads=2,
++        head_dim=16,
++        max_position_embeddings=128,
++        pad_token_id=0,
++        eos_token_id=None,
++    )
++    model = Qwen3ForCausalLM(config).eval()
++    quant_calls = 0
++
++    def quant_fn(x, **kwargs):
++        nonlocal quant_calls
++        quant_calls += 1
++        scale = x.detach().abs().amax(dim=-1, keepdim=True).clamp_min(1e-5) / 127
++        return (x / scale).round().clamp(-127, 127) * scale
++
++    class FakeEdgeRazor:
++        is_qat_enabled = True
++        qat = SimpleNamespace(selector=SimpleNamespace(has_kv_cache=True))
++
++        @staticmethod
++        def create_kv_cache(model_config=None, cache=None):
++            if cache is None:
++                cache = DynamicCache(config=model_config)
++            return QuantizedKVState(cache, quant_fn, {})
++
++    _inject_kv_cache(model, FakeEdgeRazor())
++
++    with torch.inference_mode():
++        output = model.generate(
++            torch.tensor([[1, 4, 7]]),
++            max_new_tokens=4,
++            do_sample=False,
++        )
++
++    assert output.shape == (1, 7)
++    assert quant_calls >= 2 * config.num_hidden_layers
+diff --git a/tests/integration/test_qkv_cache_integration.py b/tests/integration/test_qkv_cache_integration.py
+index 43484a0..1fa3834 100644
+--- a/tests/integration/test_qkv_cache_integration.py
++++ b/tests/integration/test_qkv_cache_integration.py
+@@ -9,14 +9,12 @@ Tests the full KV Cache QAT pipeline:
+ 6. Save/load model with quantized KV cache
+ """
+ 
+-import pytest
+ import torch
+ import torch.nn as nn
+ from transformers.cache_utils import DynamicCache
+ 
+ from edgerazor.qat.block.qkv_cache import QuantizedKVState, create_quantized_kv_cache
+ 
+-
+ # ──────────────────────────────────────────────
+ # Helper: simple attention model
+ # ──────────────────────────────────────────────
+@@ -202,7 +200,7 @@ class TestKVCacheQATSaveLoad:
+         new_model = _SimpleAttentionModel()
+         new_model.load_state_dict(torch.load(save_path))
+ 
+-        for p1, p2 in zip(model.parameters(), new_model.parameters()):
++        for p1, p2 in zip(model.parameters(), new_model.parameters(), strict=True):
+             torch.testing.assert_close(p1, p2)
+ 
+ 
+@@ -265,6 +263,36 @@ class TestCreateQuantizedKVCache:
+         assert isinstance(kv_cache, QuantizedKVState)
+         assert isinstance(kv_cache._cache, DynamicCache)
+ 
++    def test_create_wraps_existing_cache(self):
++        from edgerazor.qat.util.quant_config import QuantConfig
++
++        config = QuantConfig({
++            "method": "QAT",
++            "select": {"target_types": ["kv_cache"],
++                       "target_names": [], "exclude_types": [], "exclude_names": []},
++            "function": {
++                "epsilon": 1e-5,
++                "weight_function": "weight_quant_uniform_symmetric_clip_per_block_int1_58",
++                "w_scale_factor": 2.0,
++                "w_block_size": 64,
++                "w_mixed_precision_prop": -1.0,
++                "is_w_quantized": False,
++                "activation_function": "",
++                "a_block_size": -1,
++                "a_mixed_precision_prop": -1.0,
++                "kv_cache_function": "state_quant_uniform_symmetric_absmax_per_block_int8",
++                "kv_block_size": 128,
++                "kv_mixed_precision_prop": -1.0,
++            },
++            "training": "all",
++        })
++        existing = DynamicCache()
++
++        kv_cache = create_quantized_kv_cache(config, cache=existing)
++
++        assert isinstance(kv_cache, QuantizedKVState)
++        assert kv_cache._cache is existing
++
+     def test_create_without_kv_config_returns_none(self):
+         from edgerazor.qat.util.quant_config import QuantConfig
+ 
+diff --git a/tests/unit/test_mixed_precision.py b/tests/unit/test_mixed_precision.py
+index 8c65ba9..265347a 100644
+--- a/tests/unit/test_mixed_precision.py
++++ b/tests/unit/test_mixed_precision.py
+@@ -2,10 +2,10 @@
+ 
+ Solution: dual qweight tensors (INT4 + INT2) with inverse-perm interleave.
+ 
+-Super-group = 8 output channels, pattern repeated every 8 rows:
++Static row-wise sparse patterns used by QAT:
+ 
+   1.88-bit: [INT4, INT2, INT2, INT2, INT2, INT2, INT2, INT2]  (row % 8 == 0 → INT4)
+-  2.79-bit: [INT4, INT4, INT4, INT4, INT2, INT2, INT2, INT2]  (row % 8 < 4 → INT4)
++  2.79-bit: [INT4, INT2, INT4, INT2, INT4, INT2, INT4, INT2]  (row % 2 == 0 → INT4)
+ """
+ 
+ import pytest
+@@ -25,7 +25,7 @@ def _expected_row_mask(N: int, bits: float) -> torch.Tensor:
+     if bits == 1.88:
+         return torch.tensor([i % 8 == 0 for i in range(N)])
+     elif bits == 2.79:
+-        return torch.tensor([i % 8 < 4 for i in range(N)])
++        return torch.tensor([i % 2 == 0 for i in range(N)])
+     else:
+         raise ValueError(f"Unknown bits={bits}")
+ 
+@@ -128,6 +128,34 @@ class TestMixedPrecisionRoundtrip:
+             limit = 0.5 if mask[i] else 2.0  # INT4 tight, INT2 permissive
+             assert diff < limit, f"Row {i} max_diff={diff:.4f} > {limit}"
+ 
++    def test_w279_matches_qat_fake_quant(self):
++        """Packed rollout weights must reproduce the actor's W2.79 fake quant."""
++        from edgerazor.qat.util.quant_function import (
++            weight_quant_uniform_symmetric_clip_per_block_mp_int1_58_int4_static_row_wise_sparse,
++        )
++
++        torch.manual_seed(7)
++        weight = torch.randn(64, 256, dtype=torch.bfloat16)
++        actor_weight = weight_quant_uniform_symmetric_clip_per_block_mp_int1_58_int4_static_row_wise_sparse(
++            w=weight,
++            block_size=256,
++            w_scale_factor=2.0,
++            mixed_precision_prop=0.5,
++            epsilon=1e-5,
++        )
++        packed = quantize_weight_mixed_precision(
++            weight,
++            bits=2.79,
++            er_block_size=256,
++            ie_block_size=256,
++        )
++        rollout_weight = dequantize_weight_mixed(
++            *packed,
++            block_size=256,
++            out_dtype=torch.bfloat16,
++        )
++        assert torch.equal(actor_weight, rollout_weight)
++
+ 
+ # ── compression ratio ──────────────────────────────────────
+ 
+diff --git a/tests/unit/test_quant_mode_parse.py b/tests/unit/test_quant_mode_parse.py
+index cccabb9..2189460 100644
+--- a/tests/unit/test_quant_mode_parse.py
++++ b/tests/unit/test_quant_mode_parse.py
+@@ -33,6 +33,17 @@ class TestWeightBitsExtraction:
+         assert qm.weight_bits == 4
+         assert qm.activation_bits == 16  # no activation quant
+ 
++    @pytest.mark.parametrize(
++        "mode,expected_bits",
++        [
++            ("w2_79a8kv8_embint4_qwen3", 2.79),
++            ("w1_88a8kv8_embint4_qwen3", 1.88),
++        ],
++    )
++    def test_mixed_precision_effective_bits(self, mode, expected_bits):
++        qm = QuantModeConfig(mode)
++        assert qm.weight_bits == expected_bits
++
+ 
+ # ── Per-layer overrides ──────────────────────────────────────
+ 
+diff --git a/tests/unit/test_vllm_dynamic_reload.py b/tests/unit/test_vllm_dynamic_reload.py
+new file mode 100644
+index 0000000..2421dea
+--- /dev/null
++++ b/tests/unit/test_vllm_dynamic_reload.py
+@@ -0,0 +1,52 @@
++from types import SimpleNamespace
++
++import torch
++
++from edgerazor.vllm.dynamic_reload import (
++    prepare_for_weight_reload,
++    process_weights_after_loading,
++)
++from edgerazor.vllm.linear_py import EdgeRazorPyMixedPrecisionLinearMethod
++
++
++def test_mixed_precision_layer_can_reload_and_repack(monkeypatch):
++    monkeypatch.setattr("vllm.model_executor.parameter.get_tensor_model_parallel_rank", lambda: 0)
++    monkeypatch.setattr("vllm.model_executor.parameter.get_tensor_model_parallel_world_size", lambda: 1)
++    config = SimpleNamespace(
++        _quant_block_size=256,
++        _scale_block_size=32,
++        activation_bits=8,
++        weight_bits=2.79,
++    )
++    method = EdgeRazorPyMixedPrecisionLinearMethod(config)
++    layer = torch.nn.Module()
++    layer.quant_method = method
++
++    def weight_loader(param, loaded_weight, *args, **kwargs):
++        param.data.copy_(loaded_weight)
++
++    method.create_weights(
++        layer,
++        input_size_per_partition=256,
++        output_partition_sizes=[64],
++        input_size=256,
++        output_size=64,
++        params_dtype=torch.bfloat16,
++        weight_loader=weight_loader,
++    )
++    first_weight = torch.randn(64, 256, dtype=torch.bfloat16)
++    layer.weight.data.copy_(first_weight)
++    method.process_weights_after_loading(layer)
++
++    assert not hasattr(layer, "weight")
++    assert hasattr(layer, "qweight_int4")
++    assert prepare_for_weight_reload(layer, device=torch.device("cpu")) == 1
++    assert layer.weight.shape == first_weight.shape
++    assert not hasattr(layer, "qweight_int4")
++
++    second_weight = torch.randn_like(first_weight)
++    layer.weight.data.copy_(second_weight)
++    assert process_weights_after_loading(layer) == 1
++    assert not hasattr(layer, "weight")
++    assert hasattr(layer, "qweight_int4")
++    assert hasattr(layer, "_edgerazor_inverse_perm")

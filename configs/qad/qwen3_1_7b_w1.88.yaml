@@ -1,0 +1,51 @@
+# W1.88-A8-KV8
+qat_configuration:
+  method: QAT
+  select:
+    target_types:
+    - linear
+    - embedding
+    - kv_cache
+    target_names: []
+    exclude_types: []
+    exclude_names: []
+  function:
+    epsilon: 1.0e-05
+    weight_function: weight_quant_uniform_symmetric_clip_per_block_mp_int1_58_int4_static_row_wise_sparse
+    w_scale_factor: 2.0
+    w_block_size: 256
+    w_mixed_precision_prop: 0.125
+    is_w_quantized: False
+    activation_function: state_quant_uniform_symmetric_absmax_per_block_int8
+    a_block_size: 256
+    kv_cache_function: state_quant_uniform_symmetric_absmax_per_block_int8
+    kv_block_size: 128
+  overrides:
+  - name: model.embed_tokens
+    weight_function: weight_quant_uniform_symmetric_absmax_per_block_int4
+    w_scale_factor: -1
+    w_mixed_precision_prop: -1
+  - name: lm_head
+    weight_function: weight_quant_uniform_symmetric_absmax_per_block_int4
+    w_scale_factor: -1
+    w_mixed_precision_prop: -1
+  training: all
+kd_configuration:
+  method: KD
+  loss_task_alpha: 0.1
+  loss_1:
+    loss_type: logits
+    loss_function: compute_kld_confidence
+    alpha: 2.0
+    temperature: 1.0
+    padding_id: -100
+    use_entropy: True
+    confidence_k: 16
+    reduction: batch_mean
+  loss_2:
+    loss_type: hidden_states
+    loss_function: compute_mse
+    alpha: 0.1
+    layer_index: adaptive
+    padding_id: -100
+    reduction: batch_mean

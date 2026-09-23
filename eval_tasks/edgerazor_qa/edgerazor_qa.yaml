@@ -1,0 +1,32 @@
+# The QA suite EdgeRazor reports its "Avg." over, as a local group.
+#
+# Same twelve tasks as
+# 3rdparty/edgerazor/src/eval/tasks/lm_eval/edgerazor/qwen3_instruct.yaml
+# (group: EdgeRazor_Eval_QLLM). Renamed so it is obvious which copy you ran:
+# the upstream group cannot be used on this machine, because social_iqa and the
+# five hendrycks_ethics subtasks resolve to hub datasets that still ship loading
+# scripts, and datasets>=4 refuses those -- one failure aborts the whole group.
+# eval_tasks/social_iqa/ and eval_tasks/hendrycks_ethics/ carry parquet copies of
+# exactly those rows, so this group is the upstream one with the load path fixed,
+# not a different benchmark.
+#
+# ⚠ These are also the benchmarks EdgeRazor's own QAD data trains on:
+# task_0.2M_instruct.jsonl is built from the TRAIN splits of arc, hellaswag,
+# boolq, piqa, winogrande, social_iqa, openbookqa and ethics (see
+# 3rdparty/edgerazor/example/data-for-qllm/README.md). Scores here are in-domain
+# for any QAD run that used that file. Fine for measuring degradation between
+# two checkpoints trained the same way; not a generalization claim.
+group: edgerazor_qa
+task:
+  - arc_easy
+  - arc_challenge
+  - hellaswag
+  - boolq
+  - social_iqa
+  - openbookqa
+  - piqa
+  - winogrande
+  - hendrycks_ethics
+  - truthfulqa_mc2
+  - mmlu
+  - gsm8k

@@ -1,0 +1,4209 @@
+diff --git a/tests/experimental/agent_loop/test_rollout_sampling_config_on_cpu.py b/tests/experimental/agent_loop/test_rollout_sampling_config_on_cpu.py
+new file mode 100644
+index 00000000..1a20b835
+--- /dev/null
++++ b/tests/experimental/agent_loop/test_rollout_sampling_config_on_cpu.py
+@@ -0,0 +1,106 @@
++import asyncio
++from pathlib import Path
++from types import SimpleNamespace
++
++import torch
++from omegaconf import OmegaConf
++from tensordict import NonTensorData, TensorDict
++
++from verl.experimental.agent_loop.agent_loop import build_rollout_sampling_params
++
++
++def test_default_rollout_yaml_declares_optional_stop_strings():
++    config_path = Path(__file__).parents[3] / "verl/trainer/config/rollout/rollout.yaml"
++    config = OmegaConf.load(config_path)
++
++    assert config.stop is None
++    assert "stop" not in build_rollout_sampling_params(config)
++
++
++def test_build_sampling_params_forwards_configured_stop_strings():
++    config = SimpleNamespace(
++        temperature=1.0,
++        top_p=1.0,
++        top_k=-1,
++        calculate_log_probs=False,
++        stop=["Question:", "</s>"],
++    )
++
++    params = build_rollout_sampling_params(config)
++
++    assert params["stop"] == ["Question:", "</s>"]
++
++
++def test_build_sampling_params_omits_empty_stop_strings():
++    config = SimpleNamespace(
++        temperature=1.0,
++        top_p=1.0,
++        top_k=-1,
++        calculate_log_probs=False,
++        stop=None,
++    )
++
++    assert "stop" not in build_rollout_sampling_params(config)
++
++
++def test_build_sampling_params_forwards_configured_bad_words():
++    config = SimpleNamespace(
++        temperature=1.0,
++        top_p=1.0,
++        top_k=-1,
++        calculate_log_probs=False,
++        stop=["```"],
++        bad_words=["<think>", "</think>", "<tool_response>", "</tool_response>"],
++    )
++
++    params = build_rollout_sampling_params(config)
++
++    assert params["stop"] == ["```"]
++    assert params["bad_words"] == ["<think>", "</think>", "<tool_response>", "</tool_response>"]
++
++
++def test_transfer_queue_worker_forwards_stop_strings(monkeypatch):
++    import verl.trainer.ppo.v1.agent_loop_tq as agent_loop_tq
++
++    async def exercise_worker() -> list[dict]:
++        worker_cls = agent_loop_tq.AgentLoopWorkerTQ.__ray_metadata__.modified_class
++        worker = object.__new__(worker_cls)
++        rollout = SimpleNamespace(
++            temperature=1.0,
++            top_p=1.0,
++            top_k=-1,
++            calculate_log_probs=False,
++            stop=["Question:"],
++            bad_words=["<think>"],
++            agent=SimpleNamespace(default_agent_loop="single_turn_agent"),
++            n=1,
++            val_kwargs=SimpleNamespace(n=1, top_p=1.0, top_k=-1, temperature=0.0),
++        )
++        worker.config = SimpleNamespace(actor_rollout_ref=SimpleNamespace(rollout=rollout))
++        worker.background_tasks = set()
++        seen_params = []
++
++        async def fake_run_prompt(prompt, sampling_params, trajectory, trace=False):
++            seen_params.append(dict(sampling_params))
++
++        async def fake_trajectory_info(*args):
++            return [{"validate": False}]
++
++        worker._run_prompt = fake_run_prompt
++        monkeypatch.setattr(agent_loop_tq, "get_trajectory_info", fake_trajectory_info)
++        batch = TensorDict(
++            {
++                "uid": NonTensorData("sample-0"),
++                "index": torch.tensor([0]),
++                "global_steps": NonTensorData(1),
++            },
++            batch_size=[1],
++        )
++
++        await worker.generate_sequences(batch)
++        await asyncio.gather(*worker.background_tasks)
++        return seen_params
++
++    params = asyncio.run(exercise_worker())[0]
++    assert params["stop"] == ["Question:"]
++    assert params["bad_words"] == ["<think>"]
+diff --git a/tests/experimental/agent_loop/test_teacher_forcing_agent_loop_on_cpu.py b/tests/experimental/agent_loop/test_teacher_forcing_agent_loop_on_cpu.py
+new file mode 100644
+index 00000000..63eaa837
+--- /dev/null
++++ b/tests/experimental/agent_loop/test_teacher_forcing_agent_loop_on_cpu.py
+@@ -0,0 +1,117 @@
++import asyncio
++from types import SimpleNamespace
++
++import pytest
++
++from verl.experimental.agent_loop.teacher_forcing_agent_loop import (
++    PreferenceTeacherForcingAgentLoop,
++    tokenize_reference_trajectory,
++)
++
++
++class FakeTokenizer:
++    def apply_chat_template(self, messages, *, add_generation_prompt, tokenize, **kwargs):
++        assert kwargs == {"enable_thinking": True}
++        prompt = "prompt"
++        if add_generation_prompt:
++            return [10, 11, 12] if tokenize else prompt
++        assert messages[-1] == {"role": "assistant", "content": "#### 5"}
++        assert tokenize is False
++        return prompt + "response"
++
++    def encode(self, text, *, add_special_tokens):
++        assert text == "response"
++        assert add_special_tokens is False
++        return [20, 21, 2]
++
++    def decode(self, token_ids, *, skip_special_tokens, clean_up_tokenization_spaces):
++        assert skip_special_tokens is False
++        assert clean_up_tokenization_spaces is False
++        mapping = {
++            (20, 21, 2): "response",
++            (30, 31): "response",
++            (40, 41): "response",
++            (30, 32): "different",
++        }
++        return mapping[tuple(token_ids)]
++
++
++def test_tokenize_reference_trajectory_splits_at_generation_prompt():
++    messages = [{"role": "user", "content": "What is 2 + 3?"}]
++    prompt_ids, response_ids = tokenize_reference_trajectory(
++        FakeTokenizer(), messages, "#### 5", {"enable_thinking": True}
++    )
++
++    assert prompt_ids == [10, 11, 12]
++    assert response_ids == [20, 21, 2]
++
++
++def test_tokenize_reference_trajectory_preserves_equivalent_pretokenized_response():
++    messages = [{"role": "user", "content": "What is 2 + 3?"}]
++
++    prompt_ids, response_ids = tokenize_reference_trajectory(
++        FakeTokenizer(),
++        messages,
++        "#### 5",
++        {"enable_thinking": True},
++        response_token_ids=[30, 31],
++    )
++
++    assert prompt_ids == [10, 11, 12]
++    assert response_ids == [30, 31]
++
++
++def test_tokenize_reference_trajectory_rejects_pretokenized_text_mismatch():
++    messages = [{"role": "user", "content": "What is 2 + 3?"}]
++
++    try:
++        tokenize_reference_trajectory(
++            FakeTokenizer(),
++            messages,
++            "#### 5",
++            {"enable_thinking": True},
++            response_token_ids=[30, 32],
++        )
++    except ValueError as exc:
++        assert "does not decode" in str(exc)
++    else:
++        raise AssertionError("mismatched pre-tokenized response was accepted")
++
++
++@pytest.mark.parametrize(
++    ("session_id", "expected_ids", "expected_role"),
++    [(0, [30, 31], "chosen"), (1, [40, 41], "rejected")],
++)
++def test_preference_teacher_forcing_agent_selects_session_role(session_id, expected_ids, expected_role):
++    agent = object.__new__(PreferenceTeacherForcingAgentLoop)
++    agent.tokenizer = FakeTokenizer()
++    agent.apply_chat_template_kwargs = {"enable_thinking": True}
++    agent.rollout_config = SimpleNamespace(response_length=8)
++    agent.loop = asyncio.new_event_loop()
++    agent._cap_text_prompt_length = lambda ids: ids
++    try:
++        output = agent.loop.run_until_complete(
++            agent.run(
++                {},
++                session_id=session_id,
++                raw_prompt=[{"role": "user", "content": "What is 2 + 3?"}],
++                extra_info={
++                    "chosen_answer": "#### 5",
++                    "rejected_answer": "#### 5",
++                    "chosen_response_token_ids": [30, 31],
++                    "rejected_response_token_ids": [40, 41],
++                },
++                global_steps=3,
++            )
++        )
++    finally:
++        agent.loop.close()
++
++    assert output.response_ids == expected_ids
++    assert output.extra_fields["preference_role"] == expected_role
++
++
++def test_preference_teacher_forcing_agent_rejects_extra_session():
++    agent = object.__new__(PreferenceTeacherForcingAgentLoop)
++    with pytest.raises(ValueError, match="session_id 0 or 1"):
++        asyncio.run(agent.run({}, session_id=2))
+diff --git a/tests/experimental/reward_loop/test_analyze_opd_eval_results_on_cpu.py b/tests/experimental/reward_loop/test_analyze_opd_eval_results_on_cpu.py
+new file mode 100644
+index 00000000..b1286585
+--- /dev/null
++++ b/tests/experimental/reward_loop/test_analyze_opd_eval_results_on_cpu.py
+@@ -0,0 +1,82 @@
++import sys
++from importlib.util import module_from_spec, spec_from_file_location
++from pathlib import Path
++
++SCRIPT = (
++    Path(__file__).parents[3]
++    / "examples"
++    / "on_policy_distillation_trainer"
++    / "analyze_opd_eval_results.py"
++)
++SPEC = spec_from_file_location("analyze_opd_eval_results", SCRIPT)
++MODULE = module_from_spec(SPEC)
++assert SPEC and SPEC.loader
++sys.modules[SPEC.name] = MODULE
++SPEC.loader.exec_module(MODULE)
++
++
++def _sample(doc_id, passed, prompt_hash="prompt"):
++    return {
++        "doc_id": doc_id,
++        "doc_hash": f"doc-{doc_id}",
++        "prompt_hash": prompt_hash,
++        "target_hash": f"target-{doc_id}",
++        "arguments": {"max_gen_toks": 1024},
++        "pass@1": float(passed),
++    }
++
++
++def _gsm_sample(doc_id, passed, filter_name):
++    sample = _sample(doc_id, passed)
++    sample.pop("pass@1")
++    sample["filter"] = filter_name
++    sample["exact_match"] = float(passed)
++    return sample
++
++
++def test_exact_mcnemar_is_two_sided():
++    assert MODULE.exact_mcnemar_p(6, 7) == 1.0
++    assert MODULE.exact_mcnemar_p(0, 10) == 2 / 1024
++
++
++def test_paired_humaneval_counts_transitions_and_checks_protocol():
++    baseline = {0: _sample(0, True), 1: _sample(1, False), 2: _sample(2, False)}
++    candidate = {0: _sample(0, False), 1: _sample(1, True), 2: _sample(2, False)}
++
++    result = MODULE.paired_humaneval(baseline, candidate)
++
++    assert result["gains"] == 1
++    assert result["losses"] == 1
++    assert result["both_wrong"] == 1
++    assert result["mcnemar_p"] == 1.0
++
++
++def test_paired_gsm8k_counts_each_filter_independently():
++    baseline = {
++        "strict-match": {
++            0: _gsm_sample(0, True, "strict-match"),
++            1: _gsm_sample(1, False, "strict-match"),
++        },
++        "flexible-extract": {
++            0: _gsm_sample(0, True, "flexible-extract"),
++            1: _gsm_sample(1, False, "flexible-extract"),
++        },
++    }
++    candidate = {
++        "strict-match": {
++            0: _gsm_sample(0, False, "strict-match"),
++            1: _gsm_sample(1, True, "strict-match"),
++        },
++        "flexible-extract": {
++            0: _gsm_sample(0, True, "flexible-extract"),
++            1: _gsm_sample(1, True, "flexible-extract"),
++        },
++    }
++
++    strict = MODULE.paired_gsm8k(baseline, candidate, "strict-match")
++    flexible = MODULE.paired_gsm8k(baseline, candidate, "flexible-extract")
++
++    assert strict["gains"] == 1
++    assert strict["losses"] == 1
++    assert flexible["gains"] == 1
++    assert flexible["losses"] == 0
+diff --git a/tests/experimental/reward_loop/test_code_execution_reward_on_cpu.py b/tests/experimental/reward_loop/test_code_execution_reward_on_cpu.py
+new file mode 100644
+index 00000000..061fdcf7
+--- /dev/null
++++ b/tests/experimental/reward_loop/test_code_execution_reward_on_cpu.py
+@@ -0,0 +1,31 @@
++import json
++
++import pytest
++
++from examples.on_policy_distillation_trainer.code_execution_reward import compute_score
++
++TESTS = json.dumps({"inputs": ["1 2\n", "2 2\n"], "outputs": ["3\n", "4\n"]})
++
++
++def test_execution_reward_scores_pass_partial_and_wrong_programs():
++    passing = "```python\na, b = map(int, input().split())\nprint(a + b)\n```"
++    partial = "```python\na, b = map(int, input().split())\nprint(3)\n```"
++    wrong = "```python\na, b = map(int, input().split())\nprint(a - b)\n```"
++
++    assert compute_score("apps", passing, TESTS) == 1.0
++    assert compute_score("apps", partial, TESTS) == pytest.approx(0.55)
++    assert compute_score("apps", wrong, TESTS) == pytest.approx(0.1)
++
++
++def test_execution_reward_normalizes_output_whitespace():
++    solution = "```python\nprint('1  2')\n```"
++    tests = json.dumps({"inputs": [""], "outputs": ["1 2   \n"]})
++    assert compute_score("codecontests", solution, tests) == 1.0
++
++
++def test_execution_reward_rejects_malformed_or_unsafe_programs():
++    assert compute_score("apps", "print(3)", TESTS) == 0.0
++    assert compute_score("apps", "```python\nimport os\nprint(3)\n```", TESTS) == 0.0
++    assert compute_score("apps", "```python\nopen('/tmp/x', 'w')\n```", TESTS) == 0.0
++    assert compute_score("other", "```python\nprint(3)\n```", TESTS) == 0.0
++
+diff --git a/tests/experimental/reward_loop/test_code_syntax_reward_on_cpu.py b/tests/experimental/reward_loop/test_code_syntax_reward_on_cpu.py
+new file mode 100644
+index 00000000..20920f0b
+--- /dev/null
++++ b/tests/experimental/reward_loop/test_code_syntax_reward_on_cpu.py
+@@ -0,0 +1,13 @@
++from examples.on_policy_distillation_trainer.code_syntax_reward import compute_score
++
++
++def test_code_syntax_reward_accepts_one_valid_python_block():
++    completion = "Reasoning.\n```python\nprint(input())\n```"
++
++    assert compute_score("apps", completion, ground_truth="unused") == 1.0
++
++
++def test_code_syntax_reward_separates_format_and_syntax_failures():
++    assert compute_score("apps", "print(input())", ground_truth="unused") == 0.0
++    assert compute_score("apps", "```python\nif True print(1)\n```", ground_truth="unused") == 0.5
++    assert compute_score("apps", "```python\nprint(1)\n```\n```python\nprint(2)\n```", ground_truth="unused") == 0.0
+diff --git a/tests/experimental/reward_loop/test_evaluate_humaneval_subset_on_cpu.py b/tests/experimental/reward_loop/test_evaluate_humaneval_subset_on_cpu.py
+new file mode 100644
+index 00000000..1a7d1cf0
+--- /dev/null
++++ b/tests/experimental/reward_loop/test_evaluate_humaneval_subset_on_cpu.py
+@@ -0,0 +1,49 @@
++from examples.on_policy_distillation_trainer.evaluate_humaneval_subset import (
++    build_candidate,
++    generation_arguments,
++    select_full_batches,
++)
++
++
++def test_generation_arguments_preserve_lm_eval_protocol():
++    sample = {
++        "arguments": {
++            "gen_args_0": {
++                "arg_0": "rendered prompt",
++                "arg_1": {"until": ["\ndef"], "do_sample": False},
++            }
++        }
++    }
++
++    prompt, kwargs = generation_arguments(sample)
++
++    assert prompt == "rendered prompt"
++    assert kwargs == {"until": ["\ndef"], "do_sample": False}
++
++
++def test_build_candidate_matches_humaneval_instruct_fence_filter():
++    sample = {"doc": {"prompt": "def answer():\n"}}
++
++    candidate = build_candidate(sample, "    return 42\n```\nignored")
++
++    assert candidate == "def answer():\n    return 42\n"
++
++
++class _Tokenizer:
++    def encode(self, prompt, *, add_special_tokens):
++        assert add_special_tokens is False
++        return prompt.split()
++
++
++def test_select_full_batches_keeps_original_length_sorted_peers():
++    samples = {
++        doc_id: {
++            "doc_id": doc_id,
++            "arguments": {"gen_args_0": {"arg_0": "x " * length, "arg_1": {}}},
++        }
++        for doc_id, length in enumerate([1, 6, 2, 5, 3, 4])
++    }
++
++    selected = select_full_batches(samples, [4], _Tokenizer(), batch_size=2)
++
++    assert [sample["doc_id"] for sample in selected] == [5, 4]
+diff --git a/tests/experimental/reward_loop/test_generate_verified_mbpp_teacher_trajectories_on_cpu.py b/tests/experimental/reward_loop/test_generate_verified_mbpp_teacher_trajectories_on_cpu.py
+new file mode 100644
+index 00000000..94919840
+--- /dev/null
++++ b/tests/experimental/reward_loop/test_generate_verified_mbpp_teacher_trajectories_on_cpu.py
+@@ -0,0 +1,135 @@
++import json
++
++import pytest
++
++from examples.on_policy_distillation_trainer.generate_verified_mbpp_teacher_trajectories import (
++    ASSISTANT_PREFIX_NO_THINK,
++    assemble_teacher_native_row,
++    select_best_verified_candidate,
++)
++
++
++class CharacterTokenizer:
++    def __init__(self, function_stub: str):
++        self.function_stub = function_stub
++
++    @staticmethod
++    def encode(text, *, add_special_tokens):
++        assert add_special_tokens is False
++        return [1000 + ord(character) for character in text]
++
++    @staticmethod
++    def decode(token_ids, *, skip_special_tokens, clean_up_tokenization_spaces):
++        assert skip_special_tokens is False
++        assert clean_up_tokenization_spaces is False
++        return "".join(chr(int(token_id) - 1000) for token_id in token_ids)
++
++    def apply_chat_template(self, messages, *, add_generation_prompt, tokenize, **kwargs):
++        assert kwargs == {"enable_thinking": False}
++        base = "PROMPT"
++        if add_generation_prompt:
++            text = base + ASSISTANT_PREFIX_NO_THINK + self.function_stub
++        else:
++            text = base + messages[-1]["content"] + "<END>"
++        return self.encode(text, add_special_tokens=False) if tokenize else text
++
++
++def _source() -> dict:
++    ground_truth = {
++        "function_stub": "def add_one(x):\n",
++        "function_name": "add_one",
++        "tests": ["assert add_one(2) == 3"],
++        "test_setup_code": "",
++    }
++    return {
++        "task_id": 1,
++        "data_source": "mbpp_humaneval",
++        "prompt": [{"role": "user", "content": "complete add_one"}],
++        "ability": "code",
++        "reward_model": {"style": "rule", "ground_truth": json.dumps(ground_truth)},
++        "extra_info": {"task_id": 1, "function_name": "add_one"},
++    }
++
++
++def _candidate(tokenizer: CharacterTokenizer) -> dict:
++    completion = "    return x + 1\n"
++    generated_ids = tokenizer.encode(completion, add_special_tokens=False)
++    return {
++        "task_id": 1,
++        "completion": completion,
++        "generated_token_ids": generated_ids,
++        "generated_tokens": len(generated_ids),
++        "completion_sha256": "completion",
++        "token_ids_sha256": "tokens",
++        "teacher_total_logprob": -2.0,
++        "teacher_mean_logprob": -0.1,
++        "generation_round": 0,
++        "sample_index": 1,
++        "finish_reason": "stop",
++        "stop_reason": "```",
++        "execution_verified": True,
++        "eligible": True,
++    }
++
++
++def test_assemble_teacher_native_row_preserves_generated_token_prefix():
++    source = _source()
++    tokenizer = CharacterTokenizer("def add_one(x):\n")
++    candidate = _candidate(tokenizer)
++
++    row = assemble_teacher_native_row(
++        source,
++        candidate,
++        tokenizer,
++        max_response_length=128,
++    )
++
++    assert row["agent_name"] == "teacher_forcing_agent"
++    assert row["extra_info"]["answer"].startswith(ASSISTANT_PREFIX_NO_THINK + "def add_one(x):\n")
++    assert row["extra_info"]["response_token_ids"][: candidate["generated_tokens"]] == candidate[
++        "generated_token_ids"
++    ]
++    assert row["extra_info"]["teacher_native_execution_verified"] is True
++
++
++def test_assemble_teacher_native_row_rejects_overlong_response():
++    source = _source()
++    tokenizer = CharacterTokenizer("def add_one(x):\n")
++
++    with pytest.raises(ValueError, match="above max_response_length"):
++        assemble_teacher_native_row(
++            source,
++            _candidate(tokenizer),
++            tokenizer,
++            max_response_length=4,
++        )
++
++
++def test_select_best_verified_candidate_uses_mean_logprob_then_length():
++    candidates = [
++        {
++            "eligible": True,
++            "teacher_mean_logprob": -0.5,
++            "generated_tokens": 2,
++            "completion_sha256": "a",
++            "token_ids_sha256": "a",
++        },
++        {
++            "eligible": True,
++            "teacher_mean_logprob": -0.1,
++            "generated_tokens": 9,
++            "completion_sha256": "b",
++            "token_ids_sha256": "b",
++        },
++        {
++            "eligible": False,
++            "teacher_mean_logprob": 0.0,
++            "generated_tokens": 1,
++            "completion_sha256": "c",
++            "token_ids_sha256": "c",
++        },
++    ]
++
++    selected = select_best_verified_candidate(candidates)
++
++    assert selected["completion_sha256"] == "b"
+diff --git a/tests/experimental/reward_loop/test_gsm8k_boxed_reward_on_cpu.py b/tests/experimental/reward_loop/test_gsm8k_boxed_reward_on_cpu.py
+new file mode 100644
+index 00000000..3fed25fd
+--- /dev/null
++++ b/tests/experimental/reward_loop/test_gsm8k_boxed_reward_on_cpu.py
+@@ -0,0 +1,26 @@
++from examples.on_policy_distillation_trainer.gsm8k_boxed_reward import compute_score
++
++
++def test_compute_score_is_format_tolerant_by_default():
++    assert compute_score("openai/gsm8k", "The answer is 42.", "42") == 1.0
++    assert compute_score("openai/gsm8k", r"Therefore, \boxed{42}.", "42") == 1.0
++
++
++def test_compute_score_can_require_hash_answer_format():
++    assert compute_score("openai/gsm8k", "Answer: 42", "42", require_hash=True) == 0.0
++    assert compute_score("openai/gsm8k", "Work. #### 42", "42", require_hash=True) == 1.0
++    assert compute_score("openai/gsm8k", "Work. #### 41", "42", require_hash=True) == 0.0
++
++
++def test_compute_score_can_shape_correctness_and_hash_format():
++    kwargs = {
++        "require_hash": True,
++        "correct_without_hash_score": 0.25,
++        "hash_format_score": 0.1,
++    }
++    assert compute_score("openai/gsm8k", "Answer: 42", "42", **kwargs) == 0.25
++    assert compute_score("openai/gsm8k", "Work. #### 41", "42", **kwargs) == 0.1
++    assert compute_score("openai/gsm8k", "Answer: 41", "42", **kwargs) == 0.0
++    assert compute_score("openai/gsm8k", "Work. #### 42", "42", **kwargs) == 1.0
++    assert compute_score("openai/gsm8k", "Work. #### $42", "42", **kwargs) == 0.25
++    assert compute_score("openai/gsm8k", "Work. ####42", "42", **kwargs) == 0.25
+diff --git a/tests/experimental/reward_loop/test_interpolate_hf_checkpoints_on_cpu.py b/tests/experimental/reward_loop/test_interpolate_hf_checkpoints_on_cpu.py
+new file mode 100644
+index 00000000..f703118a
+--- /dev/null
++++ b/tests/experimental/reward_loop/test_interpolate_hf_checkpoints_on_cpu.py
+@@ -0,0 +1,56 @@
++import json
++
++import pytest
++import torch
++from safetensors.torch import load_file, save_file
++
++from examples.on_policy_distillation_trainer.interpolate_hf_checkpoints import (
++    interpolate_checkpoints,
++    interpolate_state_dicts,
++)
++
++
++def test_interpolate_state_dicts_uses_anchor_to_endpoint_formula():
++    anchor = {"weight": torch.tensor([0.0, 2.0], dtype=torch.bfloat16)}
++    endpoint = {"weight": torch.tensor([4.0, 6.0], dtype=torch.bfloat16)}
++
++    result = interpolate_state_dicts(anchor, endpoint, 0.25)
++
++    torch.testing.assert_close(result["weight"], torch.tensor([1.0, 3.0], dtype=torch.bfloat16))
++
++
++def test_interpolate_state_dicts_rejects_incompatible_inputs():
++    with pytest.raises(ValueError, match="alpha"):
++        interpolate_state_dicts({"x": torch.ones(1)}, {"x": torch.ones(1)}, 1.1)
++    with pytest.raises(ValueError, match="keys differ"):
++        interpolate_state_dicts({"x": torch.ones(1)}, {"y": torch.ones(1)}, 0.5)
++
++
++def test_interpolate_state_dicts_can_cast_floating_endpoint_dtype_explicitly():
++    anchor = {"weight": torch.tensor([0.0, 2.0], dtype=torch.float32)}
++    endpoint = {"weight": torch.tensor([4.0, 6.0], dtype=torch.bfloat16)}
++
++    with pytest.raises(ValueError, match="Tensor metadata differs"):
++        interpolate_state_dicts(anchor, endpoint, 0.25)
++
++    result = interpolate_state_dicts(anchor, endpoint, 0.25, allow_endpoint_dtype_cast=True)
++
++    assert result["weight"].dtype == torch.float32
++    torch.testing.assert_close(result["weight"], torch.tensor([1.0, 3.0]))
++
++
++def test_interpolate_checkpoints_copies_metadata_and_writes_manifest(tmp_path):
++    anchor = tmp_path / "anchor"
++    endpoint = tmp_path / "endpoint"
++    output = tmp_path / "output"
++    anchor.mkdir()
++    endpoint.mkdir()
++    save_file({"weight": torch.tensor([0.0])}, anchor / "model.safetensors", metadata={"format": "pt"})
++    save_file({"weight": torch.tensor([2.0])}, endpoint / "model.safetensors")
++    (anchor / "config.json").write_text('{"model_type":"test"}\n', encoding="utf-8")
++
++    manifest = interpolate_checkpoints(anchor, endpoint, output, 0.25)
++
++    torch.testing.assert_close(load_file(output / "model.safetensors")["weight"], torch.tensor([0.5]))
++    assert json.loads((output / "config.json").read_text())["model_type"] == "test"
++    assert json.loads((output / "interpolation.json").read_text()) == manifest
+diff --git a/tests/experimental/reward_loop/test_mbpp_execution_reward_on_cpu.py b/tests/experimental/reward_loop/test_mbpp_execution_reward_on_cpu.py
+new file mode 100644
+index 00000000..0cada437
+--- /dev/null
++++ b/tests/experimental/reward_loop/test_mbpp_execution_reward_on_cpu.py
+@@ -0,0 +1,40 @@
++import json
++
++from examples.on_policy_distillation_trainer.mbpp_execution_reward import compute_score
++
++REFERENCE = json.dumps(
++    {
++        "function_stub": 'def double(x):\n    """Double x."""\n',
++        "function_name": "double",
++        "tests": ["assert double(2) == 4", "assert double(-3) == -6"],
++        "test_setup_code": "",
++    }
++)
++
++
++def test_execution_reward_scores_passing_and_partial_completions():
++    assert compute_score("mbpp_humaneval", "    return 2 * x\n```", REFERENCE) == 1.0
++    assert compute_score("apps_humaneval", "    return 2 * x\n```", REFERENCE) == 1.0
++    partial = compute_score("mbpp_humaneval", "    return max(0, 2 * x)\n```", REFERENCE)
++    assert partial == 0.5
++    assert (
++        compute_score(
++            "mbpp_humaneval",
++            "    return max(0, 2 * x)\n```",
++            REFERENCE,
++            require_all_tests=True,
++        )
++        == 0.0
++    )
++    assert compute_score(
++        "mbpp_humaneval",
++        "    return 2 * x\n```",
++        REFERENCE,
++        require_all_tests=True,
++    ) == 1.0
++
++
++def test_execution_reward_rejects_malformed_or_dangerous_code():
++    assert compute_score("mbpp_humaneval", "not indented\n```", REFERENCE) == 0.0
++    assert compute_score("mbpp_humaneval", "    import os\n    return 2 * x\n```", REFERENCE) == 0.0
++    assert compute_score("other", "    return 2 * x", REFERENCE) == 0.0
+diff --git a/tests/experimental/reward_loop/test_mbpp_official_protocol_on_cpu.py b/tests/experimental/reward_loop/test_mbpp_official_protocol_on_cpu.py
+new file mode 100644
+index 00000000..7b8ddac2
+--- /dev/null
++++ b/tests/experimental/reward_loop/test_mbpp_official_protocol_on_cpu.py
+@@ -0,0 +1,81 @@
++import json
++
++import pandas as pd
++import pytest
++
++from examples.on_policy_distillation_trainer.analyze_mbpp_official_eval import (
++    compare,
++    exact_mcnemar_p_value,
++)
++from examples.on_policy_distillation_trainer.prepare_mbpp_official_protocol import (
++    build_official_splits,
++)
++
++
++def _row(task_id: int, source_split: str) -> dict:
++    ground_truth = {
++        "function_stub": f"def task_{task_id}():\n",
++        "function_name": f"task_{task_id}",
++        "tests": [f"assert task_{task_id}() == {task_id}"],
++        "test_setup_code": "",
++    }
++    return {
++        "task_id": task_id,
++        "data_source": "mbpp_humaneval",
++        "prompt": [{"role": "user", "content": f"task {task_id}"}],
++        "ability": "code",
++        "reward_model": {"style": "rule", "ground_truth": json.dumps(ground_truth)},
++        "extra_info": {"source_split": source_split, "split": "old"},
++    }
++
++
++def test_build_official_splits_restores_source_boundaries(tmp_path):
++    prepared = tmp_path / "prepared"
++    prepared.mkdir()
++    pd.DataFrame([_row(1, "train"), _row(2, "test")]).to_parquet(
++        prepared / "train.parquet", index=False
++    )
++    pd.DataFrame([_row(3, "validation"), _row(4, "prompt")]).to_parquet(
++        prepared / "validation.parquet", index=False
++    )
++
++    splits, manifest = build_official_splits(prepared)
++
++    assert {name: [row["task_id"] for row in rows] for name, rows in splits.items()} == {
++        "train": [1],
++        "validation": [3],
++        "test": [2],
++    }
++    assert manifest["omitted_source_splits"] == {"prompt": 1}
++    assert splits["test"][0]["extra_info"]["protocol_split"] == "test"
++    assert splits["test"][0]["extra_info"]["split"] == "test"
++
++
++def test_build_official_splits_rejects_duplicate_tasks(tmp_path):
++    prepared = tmp_path / "prepared"
++    prepared.mkdir()
++    pd.DataFrame([_row(1, "train")]).to_parquet(prepared / "train.parquet", index=False)
++    pd.DataFrame([_row(1, "test")]).to_parquet(prepared / "validation.parquet", index=False)
++
++    with pytest.raises(ValueError, match="duplicate task IDs"):
++        build_official_splits(prepared)
++
++
++def test_paired_mbpp_comparison_and_exact_mcnemar():
++    baseline = {
++        "a": {"passed": False, "score": 0.0, "input_sha256": "a"},
++        "b": {"passed": True, "score": 1.0, "input_sha256": "b"},
++        "c": {"passed": False, "score": 0.0, "input_sha256": "c"},
++    }
++    candidate = {
++        "a": {"passed": True, "score": 1.0, "input_sha256": "a"},
++        "b": {"passed": False, "score": 0.0, "input_sha256": "b"},
++        "c": {"passed": True, "score": 1.0, "input_sha256": "c"},
++    }
++
++    result = compare(baseline, candidate)
++
++    assert result["paired_gains"] == 2
++    assert result["paired_losses"] == 1
++    assert result["delta_percentage_points"] == pytest.approx(100 / 3)
++    assert result["mcnemar_exact_p"] == exact_mcnemar_p_value(2, 1) == 1.0
+diff --git a/tests/experimental/reward_loop/test_merge_hf_task_vector_consensus_on_cpu.py b/tests/experimental/reward_loop/test_merge_hf_task_vector_consensus_on_cpu.py
+new file mode 100644
+index 00000000..b652a9b3
+--- /dev/null
++++ b/tests/experimental/reward_loop/test_merge_hf_task_vector_consensus_on_cpu.py
+@@ -0,0 +1,75 @@
++import json
++
++import pytest
++import torch
++from safetensors.torch import load_file, save_file
++
++from examples.on_policy_distillation_trainer.merge_hf_task_vector_consensus import (
++    merge_checkpoints,
++    normalized_task_vector_consensus,
++)
++
++
++def test_normalized_task_vector_consensus_matches_target_norm():
++    anchor = {"weight": torch.tensor([0.0, 0.0])}
++    endpoints = [
++        {"weight": torch.tensor([2.0, 0.0])},
++        {"weight": torch.tensor([0.0, 4.0])},
++    ]
++
++    merged, diagnostics = normalized_task_vector_consensus(anchor, endpoints, target_norm_index=0)
++
++    expected = torch.tensor([2.0**0.5, 2.0**0.5])
++    torch.testing.assert_close(merged["weight"], expected)
++    assert diagnostics["endpoint_norms"] == [2.0, 4.0]
++    assert diagnostics["pairwise_cosines"]["0:1"] == 0.0
++    assert torch.linalg.vector_norm(merged["weight"]).item() == pytest.approx(2.0)
++
++
++def test_normalized_task_vector_consensus_rejects_zero_or_incompatible_endpoint():
++    anchor = {"weight": torch.tensor([0.0])}
++    with pytest.raises(ValueError, match="At least two"):
++        normalized_task_vector_consensus(anchor, [{"weight": torch.tensor([1.0])}])
++    with pytest.raises(ValueError, match="norms"):
++        normalized_task_vector_consensus(
++            anchor,
++            [{"weight": torch.tensor([0.0])}, {"weight": torch.tensor([1.0])}],
++        )
++    with pytest.raises(ValueError, match="metadata differs"):
++        normalized_task_vector_consensus(
++            anchor,
++            [{"weight": torch.tensor([[1.0]])}, {"weight": torch.tensor([1.0])}],
++        )
++
++
++def test_normalized_task_vector_consensus_promotes_floating_anchor_to_endpoint_dtype():
++    anchor = {"weight": torch.tensor([0.0, 0.0], dtype=torch.bfloat16)}
++    endpoints = [
++        {"weight": torch.tensor([2.0, 0.0], dtype=torch.float32)},
++        {"weight": torch.tensor([0.0, 4.0], dtype=torch.float32)},
++    ]
++
++    merged, diagnostics = normalized_task_vector_consensus(anchor, endpoints)
++
++    assert merged["weight"].dtype == torch.float32
++    assert diagnostics["floating_output_dtype"] == "torch.float32"
++
++
++def test_merge_checkpoints_copies_anchor_metadata_and_writes_manifest(tmp_path):
++    anchor = tmp_path / "anchor"
++    first = tmp_path / "first"
++    second = tmp_path / "second"
++    output = tmp_path / "output"
++    for path in (anchor, first, second):
++        path.mkdir()
++    save_file({"weight": torch.tensor([0.0, 0.0])}, anchor / "model.safetensors", metadata={"format": "pt"})
++    save_file({"weight": torch.tensor([2.0, 0.0])}, first / "model.safetensors")
++    save_file({"weight": torch.tensor([0.0, 4.0])}, second / "model.safetensors")
++    (anchor / "config.json").write_text('{"model_type":"test"}\n', encoding="utf-8")
++
++    manifest = merge_checkpoints(anchor, [first, second], output)
++
++    merged = load_file(output / "model.safetensors")["weight"]
++    torch.testing.assert_close(merged, torch.tensor([2.0**0.5, 2.0**0.5]))
++    assert json.loads((output / "config.json").read_text())["model_type"] == "test"
++    assert json.loads((output / "task_vector_consensus.json").read_text()) == manifest
+diff --git a/tests/experimental/reward_loop/test_opd_domain_reward_on_cpu.py b/tests/experimental/reward_loop/test_opd_domain_reward_on_cpu.py
+new file mode 100644
+index 00000000..72bdb015
+--- /dev/null
++++ b/tests/experimental/reward_loop/test_opd_domain_reward_on_cpu.py
+@@ -0,0 +1,7 @@
++from examples.on_policy_distillation_trainer.opd_domain_reward import compute_score
++
++
++def test_domain_reward_dispatches_math_and_code():
++    assert compute_score("openai/gsm8k", "Work. #### 42", "42") == 1.0
++    assert compute_score("apps", "```python\nprint(input())\n```", "unused") == 1.0
++    assert compute_score("unknown", "anything", "unused") == 0.0
+diff --git a/tests/experimental/reward_loop/test_prepare_apps_humaneval_on_cpu.py b/tests/experimental/reward_loop/test_prepare_apps_humaneval_on_cpu.py
+new file mode 100644
+index 00000000..4c2bf09b
+--- /dev/null
++++ b/tests/experimental/reward_loop/test_prepare_apps_humaneval_on_cpu.py
+@@ -0,0 +1,127 @@
++import json
++
++from examples.on_policy_distillation_trainer.prepare_apps_humaneval import (
++    EQUALITY_SETUP,
++    build_function_stub,
++    build_prompt,
++    build_tests,
++    contamination_score,
++    prepare_rows,
++)
++
++
++class FakeTokenizer:
++    def apply_chat_template(self, messages, **kwargs):
++        return list(range(len(messages[0]["content"].split())))
++
++
++def source_row(problem_id: int, question: str = "Return twice the input.") -> dict:
++    return {
++        "problem_id": problem_id,
++        "question": question,
++        "solutions": json.dumps(["def double(x):\n    return 2 * x\n"]),
++        "input_output": json.dumps(
++            {"fn_name": "double", "inputs": [[2], [-3]], "outputs": [4, -6]}
++        ),
++        "difficulty": "introductory",
++        "url": "https://example.test/problem",
++        "starter_code": "def double(x):\n    ",
++    }
++
++
++def test_build_tests_and_stub_match_humaneval_prefill():
++    tests = build_tests([[2], [-3]], [4, -6], "double")
++    stub = build_function_stub("def double(x):\n    ", "Return twice the input.", "double", tests)
++
++    assert tests == [
++        "assert __apps_equal_output(double(2), 4)",
++        "assert __apps_equal_output(double(-3), -6)",
++    ]
++    assert stub.startswith("from typing import *\n\n\ndef double(x):\n")
++    assert '    """ Return twice the input.\n    >>> double(2)' in stub
++    assert stub.endswith('    """\n\n')
++    prompt = build_prompt(stub)[0]["content"]
++    extracted = prompt.split("```python\n", 1)[1].split("\n```", 1)[0] + "\n"
++    assert extracted == stub
++
++
++def test_build_function_stub_sanitizes_nested_markdown_fences():
++    tests = build_tests([[2]], [[4]], "double")
++    stub = build_function_stub(
++        "def double(x):\n    ",
++        "Example:\n```python\ndouble(2)\n```",
++        "double",
++        tests,
++    )
++    prompt = build_prompt(stub)[0]["content"]
++
++    assert "```python\ndouble(2)" not in stub
++    assert "    ~~~python\n    double(2)\n    ~~~" in stub
++    assert "    >>> double(2)\n    4" in stub
++    assert prompt.count("```") == 2
++
++
++def test_prepare_rows_validates_references_and_serializes_call_tests():
++    rows = [source_row(problem_id) for problem_id in range(3)]
++    train, validation, manifest = prepare_rows(
++        rows,
++        FakeTokenizer(),
++        "unused",
++        val_size=1,
++        max_prompt_length=200,
++        seed=7,
++    )
++
++    assert len(train) == 2
++    assert len(validation) == 1
++    assert manifest["reference_validation"] is True
++    prepared = train[0]
++    assert prepared["data_source"] == "apps_humaneval"
++    assert prepared["task_id"] >= 1_000_000
++    reference = json.loads(prepared["reward_model"]["ground_truth"])
++    assert reference["test_setup_code"] == EQUALITY_SETUP
++    assert len(reference["tests"]) == 2
++
++
++def test_prepare_rows_rejects_methods_bad_references_and_contamination():
++    method = source_row(1)
++    method["starter_code"] = "class Solution:\n    def double(self, x):\n        "
++    bad_reference = source_row(2)
++    bad_reference["solutions"] = json.dumps(["def double(x):\n    return x\n"])
++    contaminated = source_row(3, "Check if two numbers are close enough to each other in a list.")
++    clean = source_row(4)
++
++    train, validation, manifest = prepare_rows(
++        [method, bad_reference, contaminated, clean],
++        FakeTokenizer(),
++        "unused",
++        val_size=0,
++        max_prompt_length=200,
++        seed=7,
++        humaneval_descriptions=["Check if two numbers are close enough to each other in a list."],
++    )
++
++    assert not validation
++    assert len(train) == 1
++    assert manifest["filter_counts"]["unsupported_starter"] == 1
++    assert manifest["filter_counts"]["reference_failed"] == 1
++    assert manifest["filter_counts"]["humaneval_contamination"] == 1
++
++
++def test_contamination_score_uses_exact_eight_token_overlap():
++    description = "Return the sum of all positive integers in the supplied list safely."
++    assert contamination_score(description, [description]) == 1.0
++    assert contamination_score(description, ["Compute a matrix determinant."]) == 0.0
++
++
++def test_build_tests_accepts_apps_singleton_outputs_and_restores_integer_keys():
++    tests = build_tests([[{"1": "one"}]], [["one"]], "lookup")
++    reference = {
++        "function_stub": "def lookup(values):\n    ",
++        "tests": tests,
++        "test_setup_code": EQUALITY_SETUP,
++    }
++
++    from examples.on_policy_distillation_trainer.mbpp_execution_reward import compute_score
++
++    assert compute_score("apps_humaneval", "    return values[1]\n", json.dumps(reference)) == 1.0
+diff --git a/tests/experimental/reward_loop/test_prepare_code_frontier_mix_on_cpu.py b/tests/experimental/reward_loop/test_prepare_code_frontier_mix_on_cpu.py
+new file mode 100644
+index 00000000..5fd1b96d
+--- /dev/null
++++ b/tests/experimental/reward_loop/test_prepare_code_frontier_mix_on_cpu.py
+@@ -0,0 +1,65 @@
++import json
++
++import pytest
++
++from examples.on_policy_distillation_trainer.prepare_code_frontier_mix import merge_rows
++
++
++def _row(
++    task_id: int,
++    function_name: str,
++    marker: str,
++    *,
++    apps: bool = False,
++    replay_answer: str | None = None,
++) -> dict:
++    extra_info = {"function_name": function_name}
++    if apps:
++        extra_info["source_task_id"] = task_id - 1_000_000
++    else:
++        extra_info["task_id"] = task_id
++    if replay_answer is not None:
++        extra_info.update(
++            {
++                "answer": replay_answer,
++                "replay_verified_score": 1.0,
++                "teacher_mean_logprob": -0.25,
++                "teacher_response_tokens": 8,
++            }
++        )
++    return {
++        "task_id": task_id,
++        "reward_model": {
++            "ground_truth": json.dumps(
++                {"function_name": function_name, "function_stub": marker, "tests": [f"assert {marker}"]}
++            )
++        },
++        "extra_info": extra_info,
++    }
++
++
++def test_merge_rows_normalizes_schema_and_is_deterministic():
++    sources = [
++        ("mbpp", [_row(10, "mbpp_fn", "mbpp", replay_answer="def mbpp_fn(): pass")]),
++        ("apps", [_row(1_000_020, "apps_fn", "apps", apps=True)]),
++    ]
++
++    first, first_keys = merge_rows(sources, split="train", seed=7)
++    second, second_keys = merge_rows(sources, split="train", seed=7)
++
++    assert [row["task_id"] for row in first] == [row["task_id"] for row in second]
++    assert first_keys == second_keys
++    assert {row["extra_info"]["frontier_source"] for row in first} == {"mbpp", "apps"}
++    assert [row["extra_info"]["index"] for row in first] == list(range(2))
++    assert all(set(row["extra_info"]) == set(first[0]["extra_info"]) for row in first)
++    replay_row = next(row for row in first if row["extra_info"]["frontier_source"] == "mbpp")
++    assert replay_row["extra_info"]["answer"] == "def mbpp_fn(): pass"
++    assert replay_row["extra_info"]["replay_verified_score"] == 1.0
++    assert replay_row["extra_info"]["teacher_mean_logprob"] == -0.25
++    assert replay_row["extra_info"]["teacher_response_tokens"] == 8
++
++
++def test_merge_rows_rejects_duplicate_task_ids():
++    sources = [("first", [_row(10, "first", "first")]), ("second", [_row(10, "second", "second")])]
++    with pytest.raises(ValueError, match="Duplicate task_id=10"):
++        merge_rows(sources, split="train", seed=7)
+diff --git a/tests/experimental/reward_loop/test_prepare_code_quantization_regression_on_cpu.py b/tests/experimental/reward_loop/test_prepare_code_quantization_regression_on_cpu.py
+new file mode 100644
+index 00000000..1469f55c
+--- /dev/null
++++ b/tests/experimental/reward_loop/test_prepare_code_quantization_regression_on_cpu.py
+@@ -0,0 +1,105 @@
++import json
++
++import pytest
++
++from examples.on_policy_distillation_trainer.prepare_code_quantization_regression import (
++    MIN_TRAIN_ROWS,
++    MIN_VALIDATION_ROWS,
++    build_tiers,
++    choose_tier,
++    ground_truth_key,
++    load_scan,
++    normalize_pool_schema,
++)
++
++
++def _source(task_id: int, split: str = "train") -> dict:
++    ground_truth = {
++        "function_stub": f"def fn_{task_id}():\n",
++        "function_name": f"fn_{task_id}",
++        "tests": [f"assert fn_{task_id}() == {task_id}"],
++    }
++    return {
++        "task_id": task_id,
++        "reward_model": {"ground_truth": json.dumps(ground_truth)},
++        "extra_info": {
++            "task_id": task_id,
++            "frontier_source": "synthetic",
++            "split": split,
++        },
++    }
++
++
++def _scan_rows(source: dict, successes: int, total: int = 8) -> list[dict]:
++    ground_truth = source["reward_model"]["ground_truth"]
++    return [
++        {
++            "input": f"prompt-{source['task_id']}",
++            "output": f"output-{index}",
++            "gts": ground_truth,
++            "score": float(index < successes),
++        }
++        for index in range(total)
++    ]
++
++
++def test_load_scan_and_build_nested_regression_tiers(tmp_path):
++    sources = [_source(1), _source(2, split="validation")]
++    fp_rows = _scan_rows(sources[0], 5) + _scan_rows(sources[1], 3)
++    qad_rows = _scan_rows(sources[0], 1) + _scan_rows(sources[1], 0)
++    fp_path = tmp_path / "fp.jsonl"
++    qad_path = tmp_path / "qad.jsonl"
++    fp_path.write_text("\n".join(json.dumps(row) for row in fp_rows) + "\n")
++    qad_path.write_text("\n".join(json.dumps(row) for row in qad_rows) + "\n")
++    expected = {
++        ground_truth_key(source["reward_model"]["ground_truth"]) for source in sources
++    }
++
++    fp = load_scan(fp_path, expected_keys=expected, samples_per_prompt=8)
++    qad = load_scan(qad_path, expected_keys=expected, samples_per_prompt=8)
++    tiers, diagnostics = build_tiers(
++        sources,
++        fp_stats=fp,
++        qad_stats=qad,
++        samples_per_prompt=8,
++    )
++
++    assert [row["task_id"] for row in tiers["core"]] == [1]
++    assert [row["task_id"] for row in tiers["strong"]] == [1, 2]
++    assert [row["task_id"] for row in tiers["directional"]] == [1, 2]
++    assert diagnostics[0]["success_margin"] == 4
++    assert tiers["core"][0]["extra_info"]["quant_reg_fp_successes"] == 5
++    assert tiers["core"][0]["extra_info"]["quant_reg_qad_successes"] == 1
++
++
++def test_load_scan_fails_closed_on_missing_samples(tmp_path):
++    source = _source(1)
++    path = tmp_path / "short.jsonl"
++    path.write_text("\n".join(json.dumps(row) for row in _scan_rows(source, 3, total=7)) + "\n")
++    expected = {ground_truth_key(source["reward_model"]["ground_truth"])}
++
++    with pytest.raises(ValueError, match="has 7 samples, expected 8"):
++        load_scan(path, expected_keys=expected, samples_per_prompt=8)
++
++
++def test_choose_tier_uses_strictest_tier_meeting_frozen_counts():
++    counts = {
++        "core": {"train": MIN_TRAIN_ROWS - 1, "validation": MIN_VALIDATION_ROWS},
++        "strong": {"train": MIN_TRAIN_ROWS, "validation": MIN_VALIDATION_ROWS},
++        "directional": {"train": MIN_TRAIN_ROWS + 10, "validation": MIN_VALIDATION_ROWS + 10},
++    }
++    assert choose_tier(counts) == "strong"
++
++
++def test_normalize_pool_schema_unifies_integer_and_string_source_ids():
++    rows = [
++        {"extra_info": {"source_task_id": 12}},
++        {"extra_info": {"source_task_id": "Leetcode_12_I"}},
++        {"extra_info": {"source_task_id": None}},
++    ]
++    normalize_pool_schema(rows)
++    assert [row["extra_info"]["source_task_id"] for row in rows] == [
++        "12",
++        "Leetcode_12_I",
++        None,
++    ]
+diff --git a/tests/experimental/reward_loop/test_prepare_gsm8k_eval_aligned_on_cpu.py b/tests/experimental/reward_loop/test_prepare_gsm8k_eval_aligned_on_cpu.py
+new file mode 100644
+index 00000000..3607e038
+--- /dev/null
++++ b/tests/experimental/reward_loop/test_prepare_gsm8k_eval_aligned_on_cpu.py
+@@ -0,0 +1,44 @@
++import pandas as pd
++
++from examples.on_policy_distillation_trainer.prepare_gsm8k_eval_aligned import (
++    build_eval_aligned_prompts,
++    format_fewshot_prompt,
++    sample_fewshot_indices,
++)
++
++
++def test_format_fewshot_prompt_matches_lm_eval_layout():
++    prompt = format_fewshot_prompt(
++        "What is 20 + 22?",
++        [("What is 1 + 1?", "One plus one is two.\n#### 2")],
++    )
++
++    assert prompt == (
++        "Question: What is 1 + 1?\nAnswer: One plus one is two.\n#### 2\n\nQuestion: What is 20 + 22?\nAnswer:"
++    )
++
++
++def test_sample_fewshot_indices_is_deterministic_and_excludes_target():
++    first = sample_fewshot_indices(10, 5, seed=1234, row_index=3, excluded_index=3)
++    second = sample_fewshot_indices(10, 5, seed=1234, row_index=3, excluded_index=3)
++
++    assert first == second
++    assert len(first) == len(set(first)) == 5
++    assert 3 not in first
++
++
++def test_build_eval_aligned_prompts_preserves_plain_question_answer_contract():
++    frame = pd.DataFrame(
++        {
++            "extra_info": [
++                {"question": "Target zero?", "answer": "#### 0"},
++                {"question": "Target one?", "answer": "#### 1"},
++            ]
++        }
++    )
++
++    prompts = build_eval_aligned_prompts(frame, frame, num_fewshot=1, seed=7, same_source=True)
++
++    assert prompts[0][0]["role"] == "user"
++    assert "Question: Target one?\nAnswer: #### 1" in prompts[0][0]["content"]
++    assert prompts[0][0]["content"].endswith("Question: Target zero?\nAnswer:")
+diff --git a/tests/experimental/reward_loop/test_prepare_gsm8k_strict_format_on_cpu.py b/tests/experimental/reward_loop/test_prepare_gsm8k_strict_format_on_cpu.py
+new file mode 100644
+index 00000000..414029aa
+--- /dev/null
++++ b/tests/experimental/reward_loop/test_prepare_gsm8k_strict_format_on_cpu.py
+@@ -0,0 +1,27 @@
++from examples.on_policy_distillation_trainer.prepare_gsm8k_strict_format import (
++    STRICT_INSTRUCTION,
++    rewrite_prompt,
++)
++
++
++def test_rewrite_prompt_replaces_the_weak_gsm8k_instruction():
++    prompt = [
++        {
++            "role": "user",
++            "content": 'What is 40 + 2? Let\'s think step by step and output the final answer after "####".',
++        }
++    ]
++
++    rewritten = rewrite_prompt(prompt)
++
++    assert rewritten[0]["content"] == "What is 40 + 2?" + STRICT_INSTRUCTION
++    assert prompt[0]["content"].endswith('after "####".')
++
++
++def test_rewrite_prompt_is_idempotent_and_preserves_other_messages():
++    prompt = [
++        {"role": "system", "content": "Be precise."},
++        {"role": "user", "content": "What is 1 + 1?" + STRICT_INSTRUCTION},
++    ]
++
++    assert rewrite_prompt(prompt) == prompt
+diff --git a/tests/experimental/reward_loop/test_prepare_kodcode_humaneval_on_cpu.py b/tests/experimental/reward_loop/test_prepare_kodcode_humaneval_on_cpu.py
+new file mode 100644
+index 00000000..22f5b280
+--- /dev/null
++++ b/tests/experimental/reward_loop/test_prepare_kodcode_humaneval_on_cpu.py
+@@ -0,0 +1,102 @@
++import json
++from pathlib import Path
++
++from jinja2 import Environment
++
++from examples.on_policy_distillation_trainer.prepare_kodcode_humaneval import (
++    extract_pytest_programs,
++    prepare_source_row,
++)
++from examples.on_policy_distillation_trainer.prepare_mbpp_humaneval import ASSISTANT_PREFIX
++
++
++class _Tokenizer:
++    def apply_chat_template(self, messages, *, add_generation_prompt, tokenize, **kwargs):
++        if tokenize:
++            return list(range(32))
++        if add_generation_prompt:
++            return "rendered prompt"
++        return "rendered prompt" + messages[-1]["content"]
++
++    def __call__(self, text, add_special_tokens=False):
++        return {"input_ids": list(range(len(text.split())))}
++
++
++def _source_row() -> dict:
++    return {
++        "style": "instruct",
++        "subset": "Leetcode",
++        "question_id": "Leetcode_test_I",
++        "question": "Return the sum of two integers.",
++        "solution": "def add_numbers(left, right):\n    return left + right\n",
++        "test_code": (
++            "from solution import add_numbers\n\n"
++            "def test_positive():\n    assert add_numbers(2, 3) == 5\n\n"
++            "def test_negative():\n    assert add_numbers(-2, 1) == -1\n"
++        ),
++        "test_info": [
++            {
++                "docstring": "Return a sum.",
++                "function_declaration": "def add_numbers(left, right):",
++                "function_name": "add_numbers",
++                "parameter_list": "(left, right)",
++            }
++        ],
++        "gpt_difficulty": "easy",
++    }
++
++
++def test_extract_pytest_programs_runs_test_functions_explicitly():
++    setup, tests = extract_pytest_programs(_source_row()["test_code"], "add_numbers")
++
++    assert setup == ""
++    assert len(tests) == 2
++    assert tests[0].endswith("test_positive()")
++
++
++def test_prepare_source_row_builds_verified_humaneval_protocol():
++    row = prepare_source_row(
++        _source_row(),
++        source_index=7,
++        tokenizer=_Tokenizer(),
++        chat_template="unused",
++        humaneval_descriptions=[],
++        contamination_threshold=0.3,
++        max_prompt_length=128,
++        max_response_length=128,
++        teacher_forcing=True,
++    )
++
++    assert row["task_id"] == 2_000_007
++    assert row["data_source"] == "kodcode_humaneval"
++    assert row["agent_name"] == "teacher_forcing_agent"
++    assert "add_numbers" in row["extra_info"]["answer"]
++    ground_truth = json.loads(row["reward_model"]["ground_truth"])
++    assert ground_truth["function_name"] == "add_numbers"
++    assert len(ground_truth["tests"]) == 2
++
++
++def test_chat_template_keeps_nested_markdown_fences_inside_stub():
++    template_path = (
++        Path(__file__).parents[3] / "examples/on_policy_distillation_trainer/humaneval_opd_chat_template.jinja"
++    )
++    template = Environment().from_string(template_path.read_text(encoding="utf-8"))
++    function_stub = (
++        "def add_numbers(left, right):\n"
++        "    \"\"\"Example:\n"
++        "    ```python\n"
++        "    add_numbers(2, 3)\n"
++        "    ```\n"
++        "    \"\"\"\n\n"
++    )
++    prompt = [{"role": "user", "content": f"Solve this:\n```python\n{function_stub}```\n"}]
++    answer = f"{ASSISTANT_PREFIX}{function_stub}    return left + right\n```\n"
++
++    generation_prompt = template.render(messages=prompt, add_generation_prompt=True)
++    full_conversation = template.render(
++        messages=[*prompt, {"role": "assistant", "content": answer}],
++        add_generation_prompt=False,
++    )
++
++    assert generation_prompt.endswith(function_stub)
++    assert full_conversation.startswith(generation_prompt)
+diff --git a/tests/experimental/reward_loop/test_prepare_kodcode_profile_curriculum_on_cpu.py b/tests/experimental/reward_loop/test_prepare_kodcode_profile_curriculum_on_cpu.py
+new file mode 100644
+index 00000000..f4a59e2c
+--- /dev/null
++++ b/tests/experimental/reward_loop/test_prepare_kodcode_profile_curriculum_on_cpu.py
+@@ -0,0 +1,81 @@
++import ast
++
++from examples.on_policy_distillation_trainer.prepare_kodcode_profile_curriculum import (
++    augment_stub,
++    extract_direct_examples,
++    extract_reference_body,
++    infer_annotations,
++)
++
++STUB = '''def add_numbers(left, right):
++    """Return the sum of two integers."""
++
++'''
++
++
++def _tests():
++    return [
++        "def test_positive():\n    assert add_numbers(2, 3) == 5\ntest_positive()",
++        "def test_negative():\n    assert add_numbers(-2, 1) == -1\ntest_negative()",
++    ]
++
++
++def test_extract_reference_body_uses_first_opening_and_last_closing_fence():
++    answer = (
++        "<think>\n\n</think>\n\nHere is the completed function:\n```python\n"
++        f"{STUB}    return left + right\n"
++        "    # A literal ``` inside a comment must not truncate parsing.\n```\n"
++    )
++
++    body, lines = extract_reference_body(answer, STUB, "add_numbers")
++
++    assert "return left + right" in body
++    assert lines == 1
++
++
++def test_extract_examples_and_infer_complete_literal_signature():
++    examples = extract_direct_examples(_tests(), "add_numbers")
++
++    assert [example.render() for example in examples] == [
++        (">>> add_numbers(2, 3)", "5"),
++        (">>> add_numbers(-2, 1)", "-1"),
++    ]
++    assert infer_annotations(STUB, "add_numbers", examples) == (
++        {"left": "int", "right": "int"},
++        "int",
++    )
++
++
++def test_augment_stub_adds_doctests_and_annotations_without_answer():
++    examples = extract_direct_examples(_tests(), "add_numbers")
++    annotations = infer_annotations(STUB, "add_numbers", examples)
++
++    augmented = augment_stub(
++        STUB,
++        "add_numbers",
++        examples=examples[:1],
++        annotations=annotations,
++    )
++
++    tree = ast.parse(augmented)
++    function = tree.body[0]
++    assert ast.unparse(function.args.args[0].annotation) == "int"
++    assert ast.unparse(function.returns) == "int"
++    assert ">>> add_numbers(2, 3)" in ast.get_docstring(function)
++
++
++def test_infer_annotations_rejects_inconsistent_literal_types():
++    tests = [
++        "def test_int():\n    assert identity(1) == 1\ntest_int()",
++        "def test_str():\n    assert identity('x') == 'x'\ntest_str()",
++    ]
++    examples = extract_direct_examples(tests, "identity")
++
++    assert (
++        infer_annotations(
++            'def identity(value):\n    """Return the value."""\n\n',
++            "identity",
++            examples,
++        )
++        is None
++    )
+diff --git a/tests/experimental/reward_loop/test_prepare_mbpp_frontier_curriculum_on_cpu.py b/tests/experimental/reward_loop/test_prepare_mbpp_frontier_curriculum_on_cpu.py
+new file mode 100644
+index 00000000..b2fd4bdd
+--- /dev/null
++++ b/tests/experimental/reward_loop/test_prepare_mbpp_frontier_curriculum_on_cpu.py
+@@ -0,0 +1,76 @@
++import json
++
++from examples.on_policy_distillation_trainer.prepare_mbpp_frontier_curriculum import (
++    canonical_ground_truth,
++    row_task_id,
++    scan_frontier_tasks,
++    select_frontier_rows,
++)
++
++
++def _ground_truth(function_name: str, marker: str) -> dict:
++    return {"function_name": function_name, "function_stub": marker, "tests": [f"assert {marker}"]}
++
++
++def _record(function_name: str, marker: str, score: float) -> str:
++    return json.dumps({"gts": json.dumps(_ground_truth(function_name, marker)), "score": score})
++
++
++def test_scan_frontier_tasks_requires_both_full_pass_and_failure(tmp_path):
++    (tmp_path / "1.jsonl").write_text(
++        "\n".join(
++            [
++                _record("frontier", "frontier", 0.0),
++                _record("frontier", "frontier", 1.0),
++                _record("always_passes", "always", 1.0),
++                _record("always_passes", "always", 1.0),
++                _record("never_passes", "never", 0.5),
++                _record("never_passes", "never", 0.0),
++            ]
++        )
++        + "\n"
++    )
++    (tmp_path / "11.jsonl").write_text(_record("too_late", "late", 1.0) + "\n")
++
++    frontier = scan_frontier_tasks(tmp_path, max_step=10)
++    task_key = canonical_ground_truth(_ground_truth("frontier", "frontier"))
++
++    assert set(frontier) == {task_key}
++    assert frontier[task_key] == {
++        "function_name": "frontier",
++        "samples": 2,
++        "min_score": 0.0,
++        "max_score": 1.0,
++        "full_passes": 1,
++    }
++
++
++def test_select_frontier_rows_preserves_schema_and_orders_by_task_id():
++    first_ground_truth = _ground_truth("duplicate_name", "first")
++    second_ground_truth = _ground_truth("duplicate_name", "second")
++    source_rows = [
++        {
++            "prompt": "b",
++            "reward_model": {"ground_truth": json.dumps(second_ground_truth)},
++            "extra_info": {"task_id": 20, "function_name": "duplicate_name"},
++        },
++        {
++            "prompt": "a",
++            "reward_model": {"ground_truth": json.dumps(first_ground_truth)},
++            "extra_info": {"task_id": 10, "function_name": "duplicate_name"},
++        },
++    ]
++
++    selected = select_frontier_rows(
++        source_rows,
++        {canonical_ground_truth(first_ground_truth), canonical_ground_truth(second_ground_truth)},
++    )
++
++    assert [row["prompt"] for row in selected] == ["a", "b"]
++    assert [row["extra_info"]["index"] for row in selected] == [0, 1]
++    assert all(row["extra_info"]["curriculum"] == "on_policy_frontier" for row in selected)
++
++
++def test_row_task_id_supports_mbpp_and_apps_schemas():
++    assert row_task_id({"extra_info": {"task_id": 10}}) == 10
++    assert row_task_id({"task_id": 1_000_020, "extra_info": {"source_task_id": 20}}) == 1_000_020
+diff --git a/tests/experimental/reward_loop/test_prepare_mbpp_humaneval_on_cpu.py b/tests/experimental/reward_loop/test_prepare_mbpp_humaneval_on_cpu.py
+new file mode 100644
+index 00000000..87112b22
+--- /dev/null
++++ b/tests/experimental/reward_loop/test_prepare_mbpp_humaneval_on_cpu.py
+@@ -0,0 +1,163 @@
++import json
++
++from examples.on_policy_distillation_trainer.prepare_mbpp_humaneval import (
++    ASSISTANT_PREFIX_NO_THINK,
++    build_function_stub,
++    build_prompt,
++    build_reference_answer,
++    has_external_dependencies,
++    prepare_rows,
++)
++
++
++class FakeTokenizer:
++    def apply_chat_template(self, messages, **kwargs):
++        return list(range(len(messages[0]["content"].split())))
++
++
++def test_build_function_stub_selects_tested_function_and_examples():
++    stub, name = build_function_stub(
++        "import math\n\ndef helper(x): return x\n\ndef square(x: int) -> int:\n    return x*x\n",
++        "Return the square of x.",
++        ["assert square(3) == 9", "assert square(-2) == 4"],
++    )
++    assert name == "square"
++    assert stub.startswith("import math\n\n\ndef square(x: int) -> int:\n")
++    assert "def square(x: int) -> int:" in stub
++    assert '    """ Return the square of x.\n    >>> square(3)' in stub
++    assert "Examples:" not in stub
++    assert "return x*x" not in stub
++    assert stub.endswith('    """\n\n')
++    assert build_prompt(stub)[0]["content"].startswith("Write a solution")
++    extracted_stub = build_prompt(stub)[0]["content"].split("```python\n", 1)[1].split("\n```", 1)[0] + "\n"
++    assert extracted_stub.endswith("\n\n")
++
++
++def test_build_reference_answer_matches_prefill_and_keeps_canonical_body():
++    code = "import math\n\ndef square(x: int) -> int:\n    \"\"\"Old docstring.\"\"\"\n    return x*x\n"
++    stub, name = build_function_stub(code, "Return the square of x.", ["assert square(3) == 9"])
++
++    answer = build_reference_answer(code, stub, name)
++
++    assert answer.startswith("<think>\n\n</think>\n\nHere is the completed function:\n```python\n" + stub)
++    assert "Old docstring" not in answer
++    assert "    return x * x\n```" in answer
++
++
++def test_build_reference_answer_supports_no_think_compat_prefix():
++    code = "def square(x):\n    return x*x\n"
++    stub, name = build_function_stub(code, "Return the square of x.", ["assert square(3) == 9"])
++
++    answer = build_reference_answer(code, stub, name, ASSISTANT_PREFIX_NO_THINK)
++
++    assert answer.startswith("Here is the completed function:\n```python\n" + stub)
++    assert "<think>" not in answer
++
++
++def test_prepare_rows_holds_out_validation_and_serializes_tests():
++    source = [
++        {
++            "task_id": task_id,
++            "text": "Double x.",
++            "code": "def double(x):\n    return 2*x\n",
++            "test_list": [f"assert double({task_id}) == {2 * task_id}"],
++            "test_setup_code": "",
++            "_source_split": "test" if task_id == 3 else "train",
++        }
++        for task_id in range(4)
++    ]
++    train, validation, manifest = prepare_rows(source, FakeTokenizer(), "unused", 1, 100, 7)
++    assert len(train) == 3
++    assert len(validation) == 1
++    assert manifest["train_rows"] == 3
++    reference = json.loads(train[0]["reward_model"]["ground_truth"])
++    assert reference["function_name"] == "double"
++    assert len(reference["tests"]) == 1
++    assert {row["extra_info"]["source_split"] for row in train + validation} == {"train", "test"}
++
++
++def test_prepare_rows_deduplicates_task_ids_across_splits():
++    source = [
++        {
++            "task_id": 1,
++            "text": "Double x.",
++            "code": "def double(x):\n    return 2*x\n",
++            "test_list": ["assert double(2) == 4"],
++            "test_setup_code": "",
++            "_source_split": source_split,
++        }
++        for source_split in ("train", "test")
++    ]
++    source.append(
++        {
++            "task_id": 2,
++            "text": "Double x.",
++            "code": "def double(x):\n    return 2*x\n",
++            "test_list": ["assert double(3) == 6"],
++            "test_setup_code": "",
++            "_source_split": "validation",
++        }
++    )
++
++    train, validation, manifest = prepare_rows(source, FakeTokenizer(), "unused", 1, 100, 7)
++
++    assert len(train) + len(validation) == 2
++    assert manifest["filter_counts"]["duplicate_task_id"] == 1
++
++
++def test_prepare_rows_tracks_explicit_exclusions():
++    source = [
++        {
++            "task_id": task_id,
++            "text": "Double x.",
++            "code": "def double(x):\n    return 2*x\n",
++            "test_list": [f"assert double({task_id}) == {2 * task_id}"],
++            "test_setup_code": "",
++        }
++        for task_id in range(3)
++    ]
++
++    train, validation, manifest = prepare_rows(
++        source, FakeTokenizer(), "unused", 1, 100, 7, excluded_task_ids={2}
++    )
++
++    assert len(train) + len(validation) == 2
++    assert manifest["filter_counts"]["excluded_task_id"] == 1
++
++
++def test_prepare_rows_can_emit_teacher_forcing_trajectories():
++    source = [
++        {
++            "task_id": task_id,
++            "text": "Double x.",
++            "code": "def double(x):\n    return 2*x\n",
++            "test_list": [f"assert double({task_id}) == {2 * task_id}"],
++            "test_setup_code": "",
++        }
++        for task_id in range(3)
++    ]
++
++    train, validation, manifest = prepare_rows(
++        source, FakeTokenizer(), "unused", 1, 100, 7, teacher_forcing=True
++    )
++
++    for row in train + validation:
++        assert row["agent_name"] == "teacher_forcing_agent"
++        assert row["extra_info"]["answer"].endswith("```\n")
++        assert "return 2 * x" in row["extra_info"]["answer"]
++    assert manifest["trajectory_mode"] == "teacher_forcing"
++
++
++def test_external_dependency_filter_rejects_hidden_helpers():
++    assert has_external_dependencies(
++        "def helper(x): return x * 2\ndef target(x): return helper(x)",
++        "target",
++        ["assert target(2) == 4"],
++        "",
++    )
++    assert not has_external_dependencies(
++        "import math\ndef target(x): return math.floor(x)",
++        "target",
++        ["assert target(2.2) == 2"],
++        "",
++    )
+diff --git a/tests/experimental/reward_loop/test_prepare_mbpp_hybrid_trajectories_on_cpu.py b/tests/experimental/reward_loop/test_prepare_mbpp_hybrid_trajectories_on_cpu.py
+new file mode 100644
+index 00000000..77b110ae
+--- /dev/null
++++ b/tests/experimental/reward_loop/test_prepare_mbpp_hybrid_trajectories_on_cpu.py
+@@ -0,0 +1,76 @@
++import pytest
++
++from examples.on_policy_distillation_trainer.prepare_mbpp_hybrid_trajectories import (
++    build_hybrid_rows,
++)
++
++
++def _row(task_id: int, *, reference: bool) -> dict:
++    row = {
++        "task_id": task_id,
++        "data_source": "mbpp_humaneval",
++        "prompt": [{"role": "user", "content": f"task {task_id}"}],
++        "ability": "code",
++        "reward_model": {"style": "rule", "ground_truth": f"tests-{task_id}"},
++        "extra_info": {
++            "source_dataset": "mbpp",
++            "source_split": "train",
++            "task_id": task_id,
++            "function_name": f"fn_{task_id}",
++            "split": "train",
++            "index": task_id,
++        },
++    }
++    if reference:
++        row["agent_name"] = "teacher_forcing_agent"
++        row["extra_info"]["answer"] = f"answer-{task_id}"
++    return row
++
++
++def test_build_hybrid_rows_pairs_agents_and_aligns_schema():
++    on_policy = [_row(2, reference=False), _row(1, reference=False)]
++    references = [_row(1, reference=True), _row(2, reference=True)]
++
++    rows = build_hybrid_rows(on_policy, references, include_references=True)
++
++    assert [row["task_id"] for row in rows] == [1, 1, 2, 2]
++    assert [row["agent_name"] for row in rows] == [
++        "single_turn_agent",
++        "teacher_forcing_agent",
++        "single_turn_agent",
++        "teacher_forcing_agent",
++    ]
++    assert all(row["extra_info"]["answer"].startswith("answer-") for row in rows)
++
++
++def test_build_hybrid_rows_keeps_validation_on_policy_only():
++    rows = build_hybrid_rows(
++        [_row(1, reference=False)],
++        [_row(1, reference=True)],
++        include_references=False,
++    )
++
++    assert len(rows) == 1
++    assert rows[0]["agent_name"] == "single_turn_agent"
++
++
++def test_build_hybrid_rows_supports_reference_only_training():
++    rows = build_hybrid_rows(
++        [_row(1, reference=False)],
++        [_row(1, reference=True)],
++        include_references=True,
++        include_on_policy=False,
++    )
++
++    assert len(rows) == 1
++    assert rows[0]["agent_name"] == "teacher_forcing_agent"
++    assert rows[0]["extra_info"]["answer"] == "answer-1"
++
++
++def test_build_hybrid_rows_rejects_protocol_mismatch():
++    on_policy = _row(1, reference=False)
++    reference = _row(1, reference=True)
++    reference["prompt"][0]["content"] = "different prompt"
++
++    with pytest.raises(ValueError, match="Mismatched prompt"):
++        build_hybrid_rows([on_policy], [reference], include_references=True)
+diff --git a/tests/experimental/reward_loop/test_prepare_mixed_opd_data_on_cpu.py b/tests/experimental/reward_loop/test_prepare_mixed_opd_data_on_cpu.py
+new file mode 100644
+index 00000000..af8ed753
+--- /dev/null
++++ b/tests/experimental/reward_loop/test_prepare_mixed_opd_data_on_cpu.py
+@@ -0,0 +1,48 @@
++import pandas as pd
++
++from examples.on_policy_distillation_trainer.prepare_mixed_opd_data import build_balanced_split
++
++
++def make_frame(domain, size):
++    rows = []
++    for index in range(size):
++        if domain == "math":
++            data_source = "openai/gsm8k"
++            ability = "math"
++            ground_truth = str(index)
++            extra_info = {"index": index, "question": f"Question {index}"}
++        else:
++            data_source = "apps"
++            ability = "code"
++            ground_truth = '{"inputs": ["1"], "outputs": ["1"]}'
++            extra_info = {
++                "problem_id": f"problem-{index}",
++                "source_id": str(index),
++                "difficulty": "introductory",
++                "problem_url": "",
++                "num_tests_original": 1,
++                "num_tests_kept": 1,
++            }
++        rows.append(
++            {
++                "data_source": data_source,
++                "prompt": [{"role": "user", "content": f"Prompt {index}"}],
++                "ability": ability,
++                "reward_model": {"style": "rule", "ground_truth": ground_truth},
++                "extra_info": extra_info,
++            }
++        )
++    return pd.DataFrame(rows)
++
++
++def test_balanced_split_alternates_domains_and_is_deterministic():
++    math = make_frame("math", 10)
++    code = make_frame("code", 10)
++
++    first = build_balanced_split(math, code, per_domain_size=4, seed=7, split="train")
++    second = build_balanced_split(math, code, per_domain_size=4, seed=7, split="train")
++
++    assert first == second
++    assert [row["extra_info"]["domain"] for row in first] == ["math", "code"] * 4
++    assert [row["extra_info"]["index"] for row in first] == list(range(8))
++    assert {row["ability"] for row in first} == {"math", "code"}
+diff --git a/tests/experimental/reward_loop/test_prepare_verifiable_code_on_cpu.py b/tests/experimental/reward_loop/test_prepare_verifiable_code_on_cpu.py
+new file mode 100644
+index 00000000..6eee5dc1
+--- /dev/null
++++ b/tests/experimental/reward_loop/test_prepare_verifiable_code_on_cpu.py
+@@ -0,0 +1,83 @@
++import json
++
++from examples.on_policy_distillation_trainer.prepare_verifiable_code import (
++    build_prompt,
++    normalize_source,
++    prepare_splits,
++    select_test_cases,
++)
++
++
++class FakeTokenizer:
++    def apply_chat_template(self, prompt, **kwargs):
++        assert kwargs["enable_thinking"] is False
++        return prompt[0]["content"].split()
++
++
++def make_row(index, source="apps", difficulty="introductory", words=10, tests=12):
++    return {
++        "source": source,
++        "task_type": "verifiable_code",
++        "in_source_id": str(index),
++        "problem_statement": " ".join([f"word{index}"] * words),
++        "gold_standard_solution": "```python\nprint(input())\n```",
++        "problem_id": f"problem-{index}",
++        "metadata": {"difficulty": difficulty, "problem_url": f"https://example.test/{index}"},
++        "verification_info": {
++            "language": "python",
++            "test_cases": [
++                {"fn_name": None, "input": f"{case}\n", "output": f"{case}\n", "type": "stdin_stdout"}
++                for case in range(tests)
++            ],
++        },
++    }
++
++
++def test_prompt_and_source_match_verl_code_reward_contract():
++    prompt = build_prompt("Add two integers.")
++
++    assert normalize_source("apps") == "apps"
++    assert normalize_source("code_contests") == "codecontests"
++    assert prompt[0]["role"] == "user"
++    assert "exactly one ```python code block" in prompt[0]["content"]
++    assert "standard input" in prompt[0]["content"]
++
++
++def test_test_case_selection_is_deterministic_and_bounded():
++    cases = make_row(0)["verification_info"]["test_cases"]
++
++    first = select_test_cases(cases, max_test_cases=5, seed=7, identity="apps:0")
++    second = select_test_cases(cases, max_test_cases=5, seed=7, identity="apps:0")
++
++    assert first == second
++    assert len(first) == 5
++    assert len({case["input"] for case in first}) == 5
++
++
++def test_prepare_splits_is_disjoint_filters_length_and_caps_tests():
++    rows = [make_row(index) for index in range(8)]
++    rows.append(make_row(100, words=200))
++    rows.append(make_row(0))
++    rows.append(make_row(200, source="code_contests", difficulty="7"))
++
++    train, validation, manifest = prepare_splits(
++        rows=rows,
++        tokenizer=FakeTokenizer(),
++        train_size=5,
++        val_size=2,
++        max_prompt_length=80,
++        max_test_cases=4,
++        seed=123,
++        apps_difficulties={"introductory", "interview"},
++        code_contests_max_difficulty=10,
++    )
++
++    train_ids = {row["extra_info"]["problem_id"] for row in train}
++    validation_ids = {row["extra_info"]["problem_id"] for row in validation}
++    assert not train_ids & validation_ids
++    assert len(train) == 5
++    assert len(validation) == 2
++    assert manifest["filter_counts"]["duplicate_rows"] == 1
++    assert manifest["filter_counts"]["overlong_rows"] == 1
++    assert all(row["extra_info"]["num_tests_kept"] == 4 for row in train + validation)
++    assert all(len(json.loads(row["reward_model"]["ground_truth"])["inputs"]) == 4 for row in train + validation)
+diff --git a/tests/experimental/reward_loop/test_prepare_verified_code_replay_on_cpu.py b/tests/experimental/reward_loop/test_prepare_verified_code_replay_on_cpu.py
+new file mode 100644
+index 00000000..2afb8bad
+--- /dev/null
++++ b/tests/experimental/reward_loop/test_prepare_verified_code_replay_on_cpu.py
+@@ -0,0 +1,133 @@
++import json
++
++import pytest
++
++from examples.on_policy_distillation_trainer.prepare_verified_code_replay import (
++    ASSISTANT_PREFIX,
++    build_validation_rows,
++    build_verified_replay_rows,
++    filter_replay_rows_by_response_length,
++)
++
++
++def _source(task_id: int = 1) -> dict:
++    ground_truth = {
++        "function_stub": "def add_one(x):\n",
++        "function_name": "add_one",
++        "tests": ["assert add_one(2) == 3"],
++        "test_setup_code": "",
++    }
++    return {
++        "task_id": task_id,
++        "data_source": "mbpp_humaneval",
++        "prompt": [{"role": "user", "content": "complete add_one"}],
++        "ability": "code",
++        "reward_model": {"style": "rule", "ground_truth": json.dumps(ground_truth)},
++        "extra_info": {"function_name": "add_one", "task_id": task_id},
++    }
++
++
++def _rollout(source: dict, output: str, *, score: float = 1.0, path: str = "/tmp/1.jsonl") -> dict:
++    return {
++        "gts": source["reward_model"]["ground_truth"],
++        "output": output,
++        "score": score,
++        "step": 1,
++        "_rollout_path": path,
++    }
++
++
++def test_build_verified_replay_selects_shortest_unique_full_pass():
++    source = _source()
++    rollouts = [
++        _rollout(source, "    return x + 1\n```\n", path="/tmp/2.jsonl"),
++        _rollout(source, "    value = x + 1\n    return value\n```\n", path="/tmp/1.jsonl"),
++        _rollout(source, "    return 0\n```\n", score=0.0),
++    ]
++    verified = []
++
++    def verifier(**kwargs):
++        verified.append(kwargs)
++        return 1.0
++
++    rows, stats = build_verified_replay_rows([source], rollouts, verifier=verifier)
++
++    assert len(rows) == 1
++    assert rows[0]["agent_name"] == "teacher_forcing_agent"
++    assert rows[0]["extra_info"]["answer"] == ASSISTANT_PREFIX + "def add_one(x):\n    return x + 1\n```\n"
++    assert rows[0]["extra_info"]["replay_rollout_path"] == "/tmp/2.jsonl"
++    assert verified[0]["require_all_tests"] is True
++    assert stats["reported_full_passes"] == 2
++    assert stats["unique_successful_outputs"] == 2
++
++
++def test_build_verified_replay_rejects_missing_or_unverifiable_success():
++    source = _source()
++    with pytest.raises(ValueError, match="No full-pass rollout"):
++        build_verified_replay_rows([source], [_rollout(source, "bad", score=0.0)])
++
++    with pytest.raises(ValueError, match="failed replay verification"):
++        build_verified_replay_rows([source], [_rollout(source, "    return x + 1\n")], verifier=lambda **_: 0.0)
++
++
++def test_build_validation_rows_forces_on_policy_agent_and_removes_answer():
++    source = _source()
++    source["agent_name"] = "teacher_forcing_agent"
++    source["extra_info"]["answer"] = "old answer"
++
++    rows = build_validation_rows([source])
++
++    assert rows[0]["agent_name"] == "single_turn_agent"
++    assert "answer" not in rows[0]["extra_info"]
++    assert rows[0]["extra_info"]["split"] == "validation"
++
++
++class CharacterTokenizer:
++    @staticmethod
++    def encode(text, *, add_special_tokens):
++        assert add_special_tokens is False
++        return [1000 + ord(character) for character in text]
++
++    @staticmethod
++    def decode(token_ids, *, skip_special_tokens, clean_up_tokenization_spaces):
++        assert skip_special_tokens is False
++        assert clean_up_tokenization_spaces is False
++        return "".join(chr(int(token_id) - 1000) for token_id in token_ids)
++
++    def apply_chat_template(self, messages, *, add_generation_prompt, tokenize, **kwargs):
++        assert kwargs == {"enable_thinking": False}
++        prefix = "PROMPT" + ASSISTANT_PREFIX + "def add_one(x):\n"
++        text = prefix if add_generation_prompt else "PROMPT" + messages[-1]["content"] + "<END>"
++        return self.encode(text, add_special_tokens=False) if tokenize else text
++
++
++def test_filter_replay_rows_by_exact_response_length():
++    source = _source()
++    short = _rollout(source, "    return x + 1\n```\n")
++    rows, _ = build_verified_replay_rows(
++        [source],
++        [short],
++        verifier=lambda **_: 1.0,
++    )
++    long_row = json.loads(json.dumps(rows[0]))
++    long_row["task_id"] = 2
++    long_row["extra_info"]["answer"] = (
++        ASSISTANT_PREFIX + "def add_one(x):\n    return x + 123456789\n```\n"
++    )
++    long_row["extra_info"]["replay_output_sha256"] = "long"
++    rows.append(long_row)
++
++    kept, excluded = filter_replay_rows_by_response_length(
++        rows,
++        CharacterTokenizer(),
++        max_response_length=30,
++    )
++
++    assert [row["task_id"] for row in kept] == [1]
++    assert kept[0]["extra_info"]["index"] == 0
++    assert kept[0]["extra_info"]["replay_response_tokens"] <= 30
++    assert len(excluded) == 1
++    assert excluded[0]["task_id"] == "2"
++    assert excluded[0]["function_name"] == "add_one"
++    assert excluded[0]["response_tokens"] > 30
++    assert excluded[0]["output_sha256"] == "long"
+diff --git a/tests/experimental/reward_loop/test_rank_verified_replay_by_teacher_on_cpu.py b/tests/experimental/reward_loop/test_rank_verified_replay_by_teacher_on_cpu.py
+new file mode 100644
+index 00000000..2b81f951
+--- /dev/null
++++ b/tests/experimental/reward_loop/test_rank_verified_replay_by_teacher_on_cpu.py
+@@ -0,0 +1,49 @@
++import pytest
++import torch
++
++from examples.on_policy_distillation_trainer.rank_verified_replay_by_teacher import (
++    rank_scored_rows,
++    response_logprob_stats,
++)
++
++
++def _row(task_id: int, output_hash: str, mean_logprob: float, tokens: int, answer: str) -> dict:
++    return {
++        "task_id": task_id,
++        "extra_info": {
++            "answer": answer,
++            "replay_output_sha256": output_hash,
++            "teacher_mean_logprob": mean_logprob,
++            "teacher_response_tokens": tokens,
++        },
++    }
++
++
++def test_response_logprob_stats_scores_only_response_targets():
++    input_ids = torch.tensor([[0, 1, 2, 0], [1, 2, 0, 0]])
++    logits = torch.zeros(2, 4, 3)
++    logits[0, 1, 2] = 2.0
++    logits[0, 2, 0] = 1.0
++    logits[1, 0, 2] = 3.0
++
++    totals, means = response_logprob_stats(logits, input_ids, [2, 1], [2, 1])
++
++    expected_first = torch.log_softmax(logits[0, 1:3], dim=-1)[torch.arange(2), torch.tensor([2, 0])].sum()
++    expected_second = torch.log_softmax(logits[1, 0], dim=-1)[2]
++    assert totals == pytest.approx([expected_first.item(), expected_second.item()], rel=2e-6)
++    assert means == pytest.approx([expected_first.item() / 2, expected_second.item()], rel=2e-6)
++
++
++def test_rank_scored_rows_prefers_teacher_compatible_success_over_shortest():
++    rows = [
++        _row(1, "short", -1.5, 4, "x"),
++        _row(1, "compatible", -0.2, 8, "a longer answer"),
++        _row(2, "tie-long", -0.4, 9, "a much longer answer"),
++        _row(2, "tie-short", -0.4, 5, "x"),
++    ]
++
++    selected, stats = rank_scored_rows(rows, max_per_task=1)
++
++    assert [row["extra_info"]["replay_output_sha256"] for row in selected] == ["compatible", "tie-short"]
++    assert stats["tasks_changed_from_shortest"] == 1
++    assert all(row["extra_info"]["teacher_rank_within_task"] == 0 for row in selected)
+diff --git a/tests/experimental/reward_loop/test_select_execution_frontier_on_cpu.py b/tests/experimental/reward_loop/test_select_execution_frontier_on_cpu.py
+new file mode 100644
+index 00000000..4fdc306b
+--- /dev/null
++++ b/tests/experimental/reward_loop/test_select_execution_frontier_on_cpu.py
+@@ -0,0 +1,94 @@
++import json
++import sys
++from importlib.util import module_from_spec, spec_from_file_location
++from pathlib import Path
++
++import pandas as pd
++
++SCRIPT = (
++    Path(__file__).parents[3]
++    / "examples"
++    / "on_policy_distillation_trainer"
++    / "select_execution_frontier.py"
++)
++SPEC = spec_from_file_location("select_execution_frontier", SCRIPT)
++MODULE = module_from_spec(SPEC)
++assert SPEC and SPEC.loader
++sys.modules[SPEC.name] = MODULE
++SPEC.loader.exec_module(MODULE)
++
++
++def _source() -> pd.DataFrame:
++    return pd.DataFrame(
++        [
++            {
++                "task_id": task_id,
++                "reward_model": {"ground_truth": f"gt-{task_id}", "style": "rule"},
++                "extra_info": {"split": "validation", "index": index},
++            }
++            for index, task_id in enumerate((10, 20, 30))
++        ]
++    )
++
++
++def test_load_rollout_scores_groups_repeated_observations(tmp_path: Path) -> None:
++    path = tmp_path / "rollouts.jsonl"
++    rows = [
++        {"gts": "gt-10", "score": 0.25},
++        {"gts": "gt-10", "reward": 0.75},
++        {"gts": "gt-20", "score": 1.0},
++    ]
++    path.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
++
++    assert MODULE.load_rollout_scores([path]) == {"gt-10": [0.25, 0.75], "gt-20": [1.0]}
++
++
++def test_select_frontier_keeps_only_partial_mean_scores() -> None:
++    selected, manifest = MODULE.select_frontier(
++        _source(),
++        {"gt-10": [0.0], "gt-20": [0.25, 0.75], "gt-30": [1.0]},
++        min_score=1e-9,
++        max_score=1.0 - 1e-9,
++    )
++
++    assert selected["task_id"].tolist() == [20]
++    assert selected.iloc[0]["extra_info"] == {"split": "train", "index": 0}
++    assert manifest["selected_rows"] == 1
++    assert manifest["selected_scores"]["20"] == {
++        "mean": 0.5,
++        "observations": 2,
++        "full_passes": 0,
++        "failures": 2,
++    }
++
++
++def test_select_frontier_can_require_mixed_exact_success() -> None:
++    selected, manifest = MODULE.select_frontier(
++        _source(),
++        {
++            "gt-10": [0.0, 0.5],
++            "gt-20": [0.0, 1.0],
++            "gt-30": [1.0, 1.0],
++        },
++        min_score=0.0,
++        max_score=1.0,
++        require_full_pass_and_failure=True,
++    )
++
++    assert selected["task_id"].tolist() == [20]
++    assert manifest["require_full_pass_and_failure"] is True
++    assert manifest["selected_scores"]["20"] == {
++        "mean": 0.5,
++        "observations": 2,
++        "full_passes": 1,
++        "failures": 1,
++    }
++
++
++def test_select_frontier_rejects_unknown_ground_truth() -> None:
++    try:
++        MODULE.select_frontier(_source(), {"missing": [0.5]}, min_score=0.0, max_score=1.0)
++    except ValueError as error:
++        assert "absent" in str(error)
++    else:
++        raise AssertionError("unknown ground truth should be rejected")
+diff --git a/tests/trainer/ppo/v1/test_custom_chat_template_on_cpu.py b/tests/trainer/ppo/v1/test_custom_chat_template_on_cpu.py
+new file mode 100644
+index 00000000..7ec8365b
+--- /dev/null
++++ b/tests/trainer/ppo/v1/test_custom_chat_template_on_cpu.py
+@@ -0,0 +1,32 @@
++from types import SimpleNamespace
++
++from omegaconf import OmegaConf
++
++from verl.trainer.ppo.v1 import trainer_base
++
++
++def test_init_tokenizer_applies_custom_chat_template(monkeypatch):
++    tokenizer = SimpleNamespace(chat_template="checkpoint tokenizer template")
++    processor = SimpleNamespace(chat_template="checkpoint processor template")
++    monkeypatch.setattr(trainer_base, "copy_to_local", lambda path, use_shm: path)
++    monkeypatch.setattr(trainer_base, "hf_tokenizer", lambda *args, **kwargs: tokenizer)
++    monkeypatch.setattr(trainer_base, "hf_processor", lambda *args, **kwargs: processor)
++
++    trainer = SimpleNamespace(
++        config=OmegaConf.create(
++            {
++                "actor_rollout_ref": {
++                    "model": {
++                        "path": "/tmp/model",
++                        "custom_chat_template": "configured template",
++                    }
++                },
++                "data": {"trust_remote_code": False},
++            }
++        )
++    )
++
++    trainer_base.PPOTrainer._init_tokenizer(trainer)
++
++    assert trainer.tokenizer.chat_template == "configured template"
++    assert trainer.processor.chat_template == "configured template"
+diff --git a/tests/trainer/ppo/v1/test_paired_dpo_batch_layout_on_cpu.py b/tests/trainer/ppo/v1/test_paired_dpo_batch_layout_on_cpu.py
+new file mode 100644
+index 00000000..1d8ef0e2
+--- /dev/null
++++ b/tests/trainer/ppo/v1/test_paired_dpo_batch_layout_on_cpu.py
+@@ -0,0 +1,36 @@
++import pytest
++
++from verl.trainer.ppo.v1.trainer_base import paired_dpo_batch_layout
++
++
++def test_paired_dpo_batch_layout_sorts_sessions_and_keeps_pairs_on_ranks():
++    keys = ["b_1_0", "a_0_0", "b_0_0", "a_1_0"]
++    tags = [
++        {"seq_len": 9},
++        {"seq_len": 2},
++        {"seq_len": 7},
++        {"seq_len": 3},
++    ]
++
++    order, partitions = paired_dpo_batch_layout(keys, tags, dp_size=2)
++
++    assert order == [1, 3, 2, 0]
++    assert sorted(sorted(partition) for partition in partitions) == [[0, 1], [2, 3]]
++
++
++def test_paired_dpo_batch_layout_rejects_missing_rejected_session():
++    with pytest.raises(ValueError, match="exactly sessions"):
++        paired_dpo_batch_layout(
++            ["a_0_0", "b_0_0", "b_1_0"],
++            [{"seq_len": 2}, {"seq_len": 3}, {"seq_len": 4}],
++            dp_size=1,
++        )
++
++
++def test_paired_dpo_batch_layout_requires_even_pairs_per_rank():
++    with pytest.raises(ValueError, match="divide evenly"):
++        paired_dpo_batch_layout(
++            ["a_0_0", "a_1_0", "b_0_0", "b_1_0", "c_0_0", "c_1_0"],
++            [{"seq_len": value} for value in range(2, 8)],
++            dp_size=2,
++        )
+diff --git a/tests/utils/debug/test_metrics.py b/tests/utils/debug/test_metrics.py
+index 1b2f7f8f..91507423 100644
+--- a/tests/utils/debug/test_metrics.py
++++ b/tests/utils/debug/test_metrics.py
+@@ -11,6 +11,7 @@
+ # See the License for the specific language governing permissions and
+ # limitations under the License.
+ 
++import math
+ import unittest
+ 
+ import torch
+@@ -43,6 +44,20 @@ class TestMetrics(unittest.TestCase):
+         print(metrics)
+         assert metrics["training/rollout_probs_diff_valid"] == 1
+ 
++    def test_missing_rollout_log_probs_is_reported_as_invalid(self):
++        data = DataProto.from_dict(
++            {
++                "old_log_probs": torch.zeros(2, 3),
++                "response_mask": torch.ones(2, 3),
++                "responses": torch.ones(2, 3, dtype=torch.long),
++            }
++        )
++
++        metrics = calculate_debug_metrics(data)
++
++        assert metrics["training/rollout_probs_diff_valid"] == 0
++        assert math.isnan(metrics["training/rollout_probs_diff_mean"])
++
+ 
+ if __name__ == "__main__":
+     unittest.main()
+diff --git a/tests/utils/test_edgerazor_qat.py b/tests/utils/test_edgerazor_qat.py
+new file mode 100644
+index 00000000..654fcfe5
+--- /dev/null
++++ b/tests/utils/test_edgerazor_qat.py
+@@ -0,0 +1,48 @@
++from pathlib import Path
++from types import SimpleNamespace
++
++import torch
++
++from verl.utils.qat.edgerazor import (
++    apply_edgerazor_qat,
++    build_vllm_quantization_config,
++)
++
++
++def _qat_config_path() -> Path:
++    return (
++        Path(__file__).parents[2]
++        / "examples"
++        / "on_policy_distillation_trainer"
++        / "config"
++        / "edgerazor_w2_79a8_qwen3.yaml"
++    )
++
++
++def test_apply_edgerazor_qat_keeps_latent_parameters_trainable():
++    class ToyModel(torch.nn.Module):
++        def __init__(self):
++            super().__init__()
++            self.embed_tokens = torch.nn.Embedding(512, 256)
++            self.proj = torch.nn.Linear(256, 256, bias=False)
++
++        def forward(self, tokens):
++            return self.proj(self.embed_tokens(tokens))
++
++    model = apply_edgerazor_qat(ToyModel(), str(_qat_config_path()))
++    loss = model(torch.randint(0, 512, (2, 4))).float().square().mean()
++    loss.backward()
++
++    assert model.proj.weight.grad is not None
++    assert torch.isfinite(model.proj.weight.grad).all()
++    assert model.proj.weight.shape == (256, 256)
++
++
++def test_build_vllm_config_disables_real_kv_quantization():
++    config = build_vllm_quantization_config(
++        SimpleNamespace(edgerazor_quant_mode="w2_79a8kv8_embint4_qwen3")
++    )
++    assert config["quant_method"] == "edgerazor"
++    assert config["weight_bits"] == 2.79
++    assert config["activation_bits"] == 8
++    assert config["kv_cache_bits"] == 16
+diff --git a/tests/workers/config/test_engine_config_on_cpu.py b/tests/workers/config/test_engine_config_on_cpu.py
+index 1253f5c9..e84c0926 100644
+--- a/tests/workers/config/test_engine_config_on_cpu.py
++++ b/tests/workers/config/test_engine_config_on_cpu.py
+@@ -51,6 +51,7 @@ class TestFSDPEngineConfigCPU:
+         assert config.param_offload is False
+         assert config.optimizer_offload is False
+         assert config.fsdp_size == -1
++        assert config.trainable_param_patterns == []
+ 
+     @pytest.mark.parametrize(
+         "offload_params",
+diff --git a/tests/workers/test_distillation_positive_advantage_gate_on_cpu.py b/tests/workers/test_distillation_positive_advantage_gate_on_cpu.py
+new file mode 100644
+index 00000000..c0387bd2
+--- /dev/null
++++ b/tests/workers/test_distillation_positive_advantage_gate_on_cpu.py
+@@ -0,0 +1,105 @@
++import pytest
++import torch
++from tensordict import TensorDict
++
++from verl.trainer.distillation import losses
++from verl.trainer.distillation.losses import (
++    distillation_ppo_loss,
++    gate_distillation_loss_by_positive_advantage,
++    gate_task_advantages_by_positive_advantage,
++)
++from verl.workers.config.distillation import DistillationLossConfig
++
++
++def test_positive_advantage_gate_masks_failed_and_padding_tokens():
++    losses = torch.tensor([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]])
++    advantages = torch.tensor([[1.0, 1.0, 0.0], [-1.0, 2.0, 2.0]])
++    response_mask = torch.tensor([[True, True, False], [True, True, False]])
++
++    gated, positive_fraction = gate_distillation_loss_by_positive_advantage(
++        distillation_losses=losses,
++        advantages=advantages,
++        response_mask=response_mask,
++    )
++
++    torch.testing.assert_close(gated, torch.tensor([[1.0, 2.0, 0.0], [0.0, 5.0, 0.0]]))
++    torch.testing.assert_close(positive_fraction, torch.tensor(0.75))
++
++
++def test_positive_advantage_gate_rejects_policy_gradient_distillation():
++    with pytest.raises(ValueError, match="requires directly backpropagated"):
++        DistillationLossConfig(
++            loss_mode="forward_kl_topk",
++            use_policy_gradient=True,
++            positive_advantage_only=True,
++        )
++
++
++def test_positive_task_advantage_gate_clamps_only_negative_valid_tokens():
++    advantages = torch.tensor([[1.0, -1.0, -2.0], [0.0, 2.0, -3.0]])
++    response_mask = torch.tensor([[True, True, False], [True, True, False]])
++
++    gated, positive_fraction = gate_task_advantages_by_positive_advantage(
++        advantages=advantages,
++        response_mask=response_mask,
++    )
++
++    torch.testing.assert_close(gated, torch.tensor([[1.0, 0.0, 0.0], [0.0, 2.0, 0.0]]))
++    torch.testing.assert_close(positive_fraction, torch.tensor(0.5))
++
++
++def test_positive_task_advantage_gate_requires_task_rewards():
++    with pytest.raises(ValueError, match="requires use_task_rewards=True"):
++        DistillationLossConfig(
++            loss_mode="forward_kl_topk",
++            use_policy_gradient=False,
++            use_task_rewards=False,
++            positive_task_advantage_only=True,
++        )
++
++
++def test_task_policy_loss_coefficient_rejects_negative_values():
++    with pytest.raises(ValueError, match="must be non-negative"):
++        DistillationLossConfig(task_policy_loss_coef=-0.1)
++
++
++def test_positive_task_advantage_gate_keeps_ppo_regularizers(monkeypatch):
++    data = TensorDict(
++        {
++            "advantages": torch.tensor([[1.0, -1.0]]),
++            "response_mask": torch.tensor([[True, True]]),
++        },
++        batch_size=[1],
++    )
++    loss_config = type(
++        "LossConfig",
++        (),
++        {
++            "positive_task_advantage_only": True,
++            "use_task_rewards": True,
++            "distillation_loss_coef": 0.5,
++            "task_policy_loss_coef": 0.25,
++        },
++    )()
++    distillation_config = type("DistillationConfig", (), {"distillation_loss": loss_config})()
++
++    monkeypatch.setattr(losses, "distillation_loss", lambda *args, **kwargs: (torch.tensor(2.0), {}))
++
++    def fake_ppo_loss(config, model_output, policy_data, dp_group, *, policy_gradient_coef):
++        torch.testing.assert_close(policy_data["advantages"], torch.tensor([[1.0, 0.0]]))
++        assert policy_gradient_coef == 0.25
++        return torch.tensor(3.0), {"kl_loss": torch.tensor(0.25)}
++
++    monkeypatch.setattr(losses, "ppo_loss", fake_ppo_loss)
++
++    combined_loss, metrics = distillation_ppo_loss(
++        config=object(),
++        distillation_config=distillation_config,
++        model_output={},
++        data=data,
++    )
++
++    torch.testing.assert_close(data["advantages"], torch.tensor([[1.0, -1.0]]))
++    torch.testing.assert_close(combined_loss, torch.tensor(4.0))
++    assert "kl_loss" in metrics
++    assert "actor/positive_task_advantage_fraction" in metrics
+diff --git a/tests/workers/test_distillation_topk_symmetry_on_cpu.py b/tests/workers/test_distillation_topk_symmetry_on_cpu.py
+index 492e8eb5..d2d106d7 100644
+--- a/tests/workers/test_distillation_topk_symmetry_on_cpu.py
++++ b/tests/workers/test_distillation_topk_symmetry_on_cpu.py
+@@ -42,7 +42,14 @@ import torch
+ from tensordict import TensorDict
+ 
+ from verl.trainer.distillation.fsdp.losses import compute_forward_kl_topk as compute_fsdp_forward_kl_topk
++from verl.trainer.distillation.fsdp.losses import (
++    compute_reverse_kl_topk_overlap as compute_fsdp_reverse_kl_topk_overlap,
++)
+ from verl.trainer.distillation.losses import compute_forward_kl_topk as collect_forward_kl_topk_metrics
++from verl.trainer.distillation.losses import (
++    compute_paired_dpo,
++    compute_teacher_forcing_nll,
++)
+ from verl.utils import tensordict_utils as tu
+ from verl.utils.dataset.dataset_utils import DatasetPadMode
+ from verl.workers.engine.fsdp.transformer_impl import FSDPEngineWithLMHead
+@@ -208,6 +215,119 @@ def test_forward_kl_topk_emits_overlap_metrics():
+     torch.testing.assert_close(output["overlap_token_advantage"], expected_ota)
+ 
+ 
++def test_reverse_kl_topk_overlap_matches_shared_support_kl():
++    logits = torch.tensor(
++        [
++            [0.0, 4.0, 3.0, 1.0, 0.0, 0.0],
++            [4.0, 3.0, 0.0, 0.0, 5.0, 0.0],
++            [5.0, 4.0, 3.0, 0.0, 0.0, 0.0],
++        ],
++        dtype=torch.float32,
++    ).unsqueeze(0)
++    teacher_ids = _nested_from_rows([[1, 2], [4, 5], [3, 4]]).to(torch.int64)
++    teacher_logprobs = _nested_from_rows(
++        [
++            [torch.log(torch.tensor(0.6)), torch.log(torch.tensor(0.3))],
++            [torch.log(torch.tensor(0.7)), torch.log(torch.tensor(0.2))],
++            [torch.log(torch.tensor(0.6)), torch.log(torch.tensor(0.3))],
++        ]
++    ).to(torch.float32)
++    config = SimpleNamespace(distillation_loss=SimpleNamespace(log_prob_min_clamp=None))
++
++    output = compute_fsdp_reverse_kl_topk_overlap(
++        student_logits=logits,
++        teacher_topk_log_probs=teacher_logprobs,
++        teacher_topk_ids=teacher_ids,
++        config=config,
++        data_format="thd",
++    )
++
++    student_shared = torch.softmax(torch.tensor([4.0, 3.0]), dim=0)
++    teacher_shared = torch.tensor([2.0 / 3.0, 1.0 / 3.0])
++    expected_first = (student_shared * (student_shared.log() - teacher_shared.log())).sum()
++
++    torch.testing.assert_close(output["overlap_count"], torch.tensor([[2, 1, 0]]))
++    torch.testing.assert_close(
++        output["distillation_losses"],
++        torch.tensor([[expected_first, 0.0, 0.0]]),
++    )
++    torch.testing.assert_close(
++        output["overlap_token_advantage"],
++        torch.tensor([[-expected_first / 2, 0.0, 0.0]]),
++    )
++
++
++def test_reverse_kl_topk_overlap_has_no_gradient_outside_shared_support():
++    logits = torch.tensor([[[0.0, 4.0, 3.0, 1.0]]], requires_grad=True)
++    teacher_ids = _nested_from_rows([[1, 2]]).to(torch.int64)
++    teacher_logprobs = _nested_from_rows(
++        [[torch.log(torch.tensor(0.6)), torch.log(torch.tensor(0.3))]]
++    ).to(torch.float32)
++    config = SimpleNamespace(distillation_loss=SimpleNamespace(log_prob_min_clamp=None))
++
++    output = compute_fsdp_reverse_kl_topk_overlap(
++        student_logits=logits,
++        teacher_topk_log_probs=teacher_logprobs,
++        teacher_topk_ids=teacher_ids,
++        config=config,
++        data_format="thd",
++    )
++    output["distillation_losses"].sum().backward()
++
++    torch.testing.assert_close(logits.grad[..., 0], torch.zeros_like(logits.grad[..., 0]), atol=1e-7, rtol=0)
++    torch.testing.assert_close(logits.grad[..., 3], torch.zeros_like(logits.grad[..., 3]), atol=1e-7, rtol=0)
++
++
++def test_reverse_kl_topk_overlap_zero_support_backpropagates_zero():
++    logits = torch.tensor([[[4.0, 3.0, 2.0, 1.0]]], requires_grad=True)
++    teacher_ids = _nested_from_rows([[2, 3]]).to(torch.int64)
++    teacher_logprobs = _nested_from_rows(
++        [[torch.log(torch.tensor(0.6)), torch.log(torch.tensor(0.3))]]
++    ).to(torch.float32)
++    config = SimpleNamespace(distillation_loss=SimpleNamespace(log_prob_min_clamp=None))
++
++    output = compute_fsdp_reverse_kl_topk_overlap(
++        student_logits=logits,
++        teacher_topk_log_probs=teacher_logprobs,
++        teacher_topk_ids=teacher_ids,
++        config=config,
++        data_format="thd",
++    )
++    output["distillation_losses"].sum().backward()
++
++    torch.testing.assert_close(output["distillation_losses"], torch.zeros(1, 1))
++    torch.testing.assert_close(logits.grad, torch.zeros_like(logits.grad))
++
++
++def test_reverse_kl_topk_overlap_mixed_support_has_finite_gradients():
++    logits = torch.tensor(
++        [[[4.0, 3.0, 2.0, 1.0], [0.0, 4.0, 3.0, 1.0]]],
++        requires_grad=True,
++    )
++    teacher_ids = _nested_from_rows([[2, 3], [1, 2]]).to(torch.int64)
++    teacher_logprobs = _nested_from_rows(
++        [
++            [torch.log(torch.tensor(0.6)), torch.log(torch.tensor(0.3))],
++            [torch.log(torch.tensor(0.6)), torch.log(torch.tensor(0.3))],
++        ]
++    ).to(torch.float32)
++    config = SimpleNamespace(distillation_loss=SimpleNamespace(log_prob_min_clamp=-10.0))
++
++    output = compute_fsdp_reverse_kl_topk_overlap(
++        student_logits=logits,
++        teacher_topk_log_probs=teacher_logprobs,
++        teacher_topk_ids=teacher_ids,
++        config=config,
++        data_format="thd",
++    )
++    output["distillation_losses"].sum().backward()
++
++    assert torch.isfinite(output["distillation_losses"]).all()
++    assert torch.isfinite(logits.grad).all()
++    torch.testing.assert_close(logits.grad[:, 0], torch.zeros_like(logits.grad[:, 0]))
++    assert logits.grad[:, 1].abs().sum() > 0
++
++
+ def test_forward_kl_topk_metric_aggregation_for_overlap_outputs():
+     data = TensorDict(
+         {
+@@ -236,3 +356,91 @@ def test_forward_kl_topk_metric_aggregation_for_overlap_outputs():
+ 
+     assert metrics["distillation/overlap_ratio"] == pytest.approx(0.75)
+     assert metrics["distillation/overlap_token_advantage"] == pytest.approx(-0.3)
++
++
++def test_teacher_forcing_nll_is_negative_student_log_probability():
++    data = TensorDict(
++        {
++            "prompts": torch.tensor([[101]]),
++            "responses": torch.tensor([[11, 12, 0]]),
++            "attention_mask": torch.tensor([[1, 1, 1, 0]]),
++            "response_mask": torch.tensor([[1, 1, 0]], dtype=torch.bool),
++        },
++        batch_size=[1],
++    )
++    student_log_probs = torch.tensor([-0.25, -1.5, -9.0], requires_grad=True)
++
++    token_nll, metrics = compute_teacher_forcing_nll(
++        config=SimpleNamespace(),
++        distillation_config=SimpleNamespace(),
++        model_output={"log_probs": student_log_probs},
++        data=data,
++    )
++
++    torch.testing.assert_close(token_nll, torch.tensor([[0.25, 1.5, 0.0]]))
++    assert metrics["distillation/token_nll"].aggregate() == pytest.approx(0.875)
++    token_nll[data["response_mask"]].mean().backward()
++    torch.testing.assert_close(student_log_probs.grad, torch.tensor([-0.5, -0.5, 0.0]))
++
++
++def test_paired_dpo_uses_reference_corrected_pair_margin_and_gradient_direction():
++    data = TensorDict(
++        {
++            "prompts": torch.tensor([[101], [101], [102], [102]]),
++            "responses": torch.tensor([[11, 12], [13, 14], [15, 16], [17, 18]]),
++            "attention_mask": torch.ones(4, 3, dtype=torch.long),
++            "response_mask": torch.ones(4, 2, dtype=torch.bool),
++            "session_id": torch.tensor([0, 1, 0, 1]),
++            "ref_log_prob": torch.tensor(
++                [[-1.5, -1.5], [-2.0, -2.0], [-2.0, -2.0], [-2.0, -2.0]]
++            ),
++        },
++        batch_size=[4],
++    )
++    student_log_probs = torch.tensor(
++        [-1.0, -1.0, -2.0, -2.0, -2.0, -2.0, -1.0, -1.0],
++        requires_grad=True,
++    )
++    distillation_config = SimpleNamespace(
++        distillation_loss=SimpleNamespace(preference_beta=0.1)
++    )
++
++    token_losses, metrics = compute_paired_dpo(
++        config=SimpleNamespace(),
++        distillation_config=distillation_config,
++        model_output={"log_probs": student_log_probs},
++        data=data,
++    )
++
++    expected_pair_losses = -torch.nn.functional.logsigmoid(torch.tensor([0.1, -0.2]))
++    torch.testing.assert_close(token_losses[:, 0], expected_pair_losses.repeat_interleave(2))
++    assert metrics["distillation/dpo_preference_accuracy"].aggregate() == pytest.approx(0.5)
++    token_losses[:, 0].mean().backward()
++    gradients = student_log_probs.grad.reshape(4, 2)
++    assert (gradients[0] < 0).all()
++    assert (gradients[1] > 0).all()
++    assert (gradients[2] < 0).all()
++    assert (gradients[3] > 0).all()
++
++
++def test_paired_dpo_rejects_non_adjacent_sessions():
++    data = TensorDict(
++        {
++            "prompts": torch.tensor([[101], [101]]),
++            "responses": torch.tensor([[11], [12]]),
++            "attention_mask": torch.ones(2, 2, dtype=torch.long),
++            "response_mask": torch.ones(2, 1, dtype=torch.bool),
++            "session_id": torch.tensor([1, 0]),
++            "ref_log_prob": torch.tensor([[-1.0], [-1.0]]),
++        },
++        batch_size=[2],
++    )
++    with pytest.raises(ValueError, match="ordered as \\[0, 1\\]"):
++        compute_paired_dpo(
++            config=SimpleNamespace(),
++            distillation_config=SimpleNamespace(
++                distillation_loss=SimpleNamespace(preference_beta=0.1)
++            ),
++            model_output={"log_probs": torch.tensor([-1.0, -1.0])},
++            data=data,
++        )
+diff --git a/tests/workers/test_fsdp_qat_forward_only_on_cpu.py b/tests/workers/test_fsdp_qat_forward_only_on_cpu.py
+new file mode 100644
+index 00000000..b72552b9
+--- /dev/null
++++ b/tests/workers/test_fsdp_qat_forward_only_on_cpu.py
+@@ -0,0 +1,53 @@
++from types import SimpleNamespace
++
++import pytest
++import torch
++
++from verl.workers.engine.fsdp import transformer_impl
++
++
++def test_forward_only_engine_applies_qat_before_fsdp(monkeypatch):
++    source = torch.nn.Linear(2, 2)
++    quantized = torch.nn.Linear(2, 2)
++    calls = []
++
++    engine = SimpleNamespace(
++        _is_lora=False,
++        _qat_enabled=True,
++        engine_config=SimpleNamespace(forward_only=True),
++        rank=1,
++        _build_module=lambda: source,
++        _apply_qat=lambda module: calls.append(module) or quantized,
++        _build_fsdp_module=lambda module: module,
++    )
++    monkeypatch.setattr(torch.distributed, "barrier", lambda: None)
++    monkeypatch.setattr(transformer_impl, "log_gpu_memory_usage", lambda *args, **kwargs: None)
++
++    transformer_impl.FSDPEngine._build_model_optimizer(engine)
++
++    assert calls == [source]
++    assert engine.module is quantized
++    assert engine.optimizer is None
++    assert engine.lr_scheduler is None
++
++
++def test_trainable_param_patterns_freezes_parameters_outside_allowlist():
++    module = torch.nn.ModuleDict(
++        {
++            "linear": torch.nn.Linear(4, 4),
++            "input_layernorm": torch.nn.LayerNorm(4),
++            "post_attention_layernorm": torch.nn.LayerNorm(4),
++        }
++    )
++
++    tensor_count, parameter_count = transformer_impl.set_trainable_param_patterns(module, [r"layernorm"])
++
++    assert tensor_count == 4
++    assert parameter_count == 16
++    assert all(not parameter.requires_grad for parameter in module["linear"].parameters())
++    assert all(parameter.requires_grad for parameter in module["input_layernorm"].parameters())
++
++
++def test_trainable_param_patterns_rejects_empty_match():
++    with pytest.raises(ValueError, match="matched no parameters"):
++        transformer_impl.set_trainable_param_patterns(torch.nn.Linear(2, 2), [r"layernorm"])
+diff --git a/verl/experimental/agent_loop/__init__.py b/verl/experimental/agent_loop/__init__.py
+index 92385b42..f5a00d54 100644
+--- a/verl/experimental/agent_loop/__init__.py
++++ b/verl/experimental/agent_loop/__init__.py
+@@ -17,17 +17,21 @@ from .agent_loop import (
+     AgentLoopManager,
+     AgentLoopOutput,
+     AgentLoopWorker,
++    build_rollout_sampling_params,
+     get_trajectory_info,
+ )
+ from .single_turn_agent_loop import SingleTurnAgentLoop
++from .teacher_forcing_agent_loop import TeacherForcingAgentLoop
+ from .tool_agent_loop import ToolAgentLoop
+ 
+-_ = [SingleTurnAgentLoop, ToolAgentLoop]
++_ = [SingleTurnAgentLoop, TeacherForcingAgentLoop, ToolAgentLoop]
+ 
+ __all__ = [
+     "AgentLoopBase",
+     "AgentLoopManager",
+     "AgentLoopWorker",
+     "AgentLoopOutput",
++    "build_rollout_sampling_params",
+     "get_trajectory_info",
++    "TeacherForcingAgentLoop",
+ ]
+diff --git a/verl/experimental/agent_loop/agent_loop.py b/verl/experimental/agent_loop/agent_loop.py
+index 9b618f89..a5e8971c 100644
+--- a/verl/experimental/agent_loop/agent_loop.py
++++ b/verl/experimental/agent_loop/agent_loop.py
+@@ -78,6 +78,21 @@ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
+ DEFAULT_ROUTING_CACHE_SIZE = 10000
+ 
+ 
++def build_rollout_sampling_params(config: RolloutConfig) -> dict[str, Any]:
++    sampling_params = dict(
++        temperature=config.temperature,
++        top_p=config.top_p,
++        top_k=config.top_k,
++        repetition_penalty=1.0,
++        logprobs=config.calculate_log_probs,
++    )
++    if config.stop:
++        sampling_params["stop"] = list(config.stop)
++    if getattr(config, "bad_words", None):
++        sampling_params["bad_words"] = list(config.bad_words)
++    return sampling_params
++
++
+ class AgentLoopMetrics(BaseModel):
+     """Agent loop performance metrics."""
+ 
+@@ -581,13 +596,7 @@ class AgentLoopWorker:
+         """
+         config = self.rollout_config
+         validate = batch.meta_info.get("validate", False)
+-        sampling_params = dict(
+-            temperature=config.temperature,
+-            top_p=config.top_p,
+-            top_k=config.top_k,
+-            repetition_penalty=1.0,
+-            logprobs=config.calculate_log_probs,
+-        )
++        sampling_params = build_rollout_sampling_params(config)
+ 
+         def apply_greedy_sampling_params(params: dict[str, Any]) -> None:
+             params["top_p"] = 1.0
+diff --git a/verl/experimental/agent_loop/teacher_forcing_agent_loop.py b/verl/experimental/agent_loop/teacher_forcing_agent_loop.py
+new file mode 100644
+index 00000000..1827523f
+--- /dev/null
++++ b/verl/experimental/agent_loop/teacher_forcing_agent_loop.py
+@@ -0,0 +1,158 @@
++# Copyright 2024 Bytedance Ltd. and/or its affiliates
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++
++from typing import Any
++
++from verl.experimental.agent_loop.agent_loop import (
++    AgentLoopBase,
++    AgentLoopMetrics,
++    AgentLoopOutput,
++    register,
++)
++from verl.utils.tokenizer import normalize_token_ids
++
++
++def tokenize_reference_trajectory(
++    tokenizer,
++    messages: list[dict],
++    answer: str,
++    chat_template_kwargs: dict,
++    response_token_ids=None,
++):
++    """Tokenize a fixed response, optionally preserving pre-generated token ids.
++
++    ``response_token_ids`` is useful when a teacher generated a valid token
++    sequence that is not the canonical BPE encoding under the student
++    tokenizer. The supplied ids are accepted only when they decode to exactly
++    the same response text as the dataset answer.
++    """
++    prompt_ids = normalize_token_ids(
++        tokenizer.apply_chat_template(
++            messages,
++            add_generation_prompt=True,
++            tokenize=True,
++            **chat_template_kwargs,
++        )
++    )
++    prompt_text = tokenizer.apply_chat_template(
++        messages,
++        add_generation_prompt=True,
++        tokenize=False,
++        **chat_template_kwargs,
++    )
++    full_text = tokenizer.apply_chat_template(
++        [*messages, {"role": "assistant", "content": answer}],
++        add_generation_prompt=False,
++        tokenize=False,
++        **chat_template_kwargs,
++    )
++    if not full_text.startswith(prompt_text):
++        raise ValueError("Reference response does not share the generation-prompt text prefix")
++
++    # Encode the suffix separately. BPE tokenization can merge the final prompt
++    # characters with the first response characters, even when the text prefix
++    # is exact; preserving prompt_ids keeps the training context equal to rollout.
++    response_ids = normalize_token_ids(tokenizer.encode(full_text[len(prompt_text) :], add_special_tokens=False))
++    if response_token_ids is not None:
++        supplied_response_ids = normalize_token_ids(response_token_ids)
++        if not supplied_response_ids:
++            raise ValueError("Pre-tokenized reference response is empty")
++        canonical_text = tokenizer.decode(
++            response_ids,
++            skip_special_tokens=False,
++            clean_up_tokenization_spaces=False,
++        )
++        supplied_text = tokenizer.decode(
++            supplied_response_ids,
++            skip_special_tokens=False,
++            clean_up_tokenization_spaces=False,
++        )
++        if supplied_text != canonical_text:
++            raise ValueError("Pre-tokenized reference response does not decode to the dataset answer")
++        response_ids = supplied_response_ids
++    return prompt_ids, response_ids
++
++
++@register("teacher_forcing_agent")
++class TeacherForcingAgentLoop(AgentLoopBase):
++    """Return the dataset reference solution instead of sampling from the student."""
++
++    async def run(self, sampling_params: dict[str, Any], **kwargs) -> AgentLoopOutput:
++        del sampling_params
++        messages = list(kwargs["raw_prompt"])
++        answer = str(kwargs["extra_info"]["answer"])
++        prompt_ids, response_ids = await self.loop.run_in_executor(
++            None,
++            tokenize_reference_trajectory,
++            self.tokenizer,
++            messages,
++            answer,
++            self.apply_chat_template_kwargs,
++            kwargs["extra_info"].get("response_token_ids"),
++        )
++
++        prompt_ids = self._cap_text_prompt_length(prompt_ids)
++        response_ids = response_ids[: self.rollout_config.response_length]
++        global_steps = int(kwargs.get("global_steps", -1))
++        return AgentLoopOutput(
++            prompt_ids=prompt_ids,
++            response_ids=response_ids,
++            response_mask=[1] * len(response_ids),
++            num_turns=2,
++            metrics=AgentLoopMetrics(),
++            extra_fields={
++                "turn_scores": [],
++                "tool_rewards": [],
++                "reference_trajectory": True,
++                "min_global_steps": global_steps,
++                "max_global_steps": global_steps,
++            },
++        )
++
++
++@register("preference_teacher_forcing_agent")
++class PreferenceTeacherForcingAgentLoop(AgentLoopBase):
++    """Return one chosen/rejected fixed response according to rollout session."""
++
++    async def run(self, sampling_params: dict[str, Any], **kwargs) -> AgentLoopOutput:
++        del sampling_params
++        session_id = int(kwargs["session_id"])
++        if session_id not in {0, 1}:
++            raise ValueError(f"preference_teacher_forcing_agent requires session_id 0 or 1, got {session_id}")
++        role = "chosen" if session_id == 0 else "rejected"
++        messages = list(kwargs["raw_prompt"])
++        extra_info = kwargs["extra_info"]
++        answer = str(extra_info[f"{role}_answer"])
++        prompt_ids, response_ids = await self.loop.run_in_executor(
++            None,
++            tokenize_reference_trajectory,
++            self.tokenizer,
++            messages,
++            answer,
++            self.apply_chat_template_kwargs,
++            extra_info.get(f"{role}_response_token_ids"),
++        )
++
++        prompt_ids = self._cap_text_prompt_length(prompt_ids)
++        response_ids = response_ids[: self.rollout_config.response_length]
++        global_steps = int(kwargs.get("global_steps", -1))
++        return AgentLoopOutput(
++            prompt_ids=prompt_ids,
++            response_ids=response_ids,
++            response_mask=[1] * len(response_ids),
++            num_turns=2,
++            metrics=AgentLoopMetrics(),
++            extra_fields={
++                "turn_scores": [],
++                "tool_rewards": [],
++                "reference_trajectory": True,
++                "preference_role": role,
++                "min_global_steps": global_steps,
++                "max_global_steps": global_steps,
++            },
++        )
+diff --git a/verl/trainer/config/_generated_ppo_megatron_trainer.yaml b/verl/trainer/config/_generated_ppo_megatron_trainer.yaml
+index a74e0495..333544ba 100644
+--- a/verl/trainer/config/_generated_ppo_megatron_trainer.yaml
++++ b/verl/trainer/config/_generated_ppo_megatron_trainer.yaml
+@@ -281,6 +281,8 @@ actor_rollout_ref:
+     temperature: 1.0
+     top_k: -1
+     top_p: 1
++    stop: null
++    bad_words: null
+     full_determinism: false
+     seed: 42
+     prompt_length: ${oc.select:data.max_prompt_length,512}
+diff --git a/verl/trainer/config/_generated_ppo_torchtitan_trainer.yaml b/verl/trainer/config/_generated_ppo_torchtitan_trainer.yaml
+index 6debd886..4c551dc4 100644
+--- a/verl/trainer/config/_generated_ppo_torchtitan_trainer.yaml
++++ b/verl/trainer/config/_generated_ppo_torchtitan_trainer.yaml
+@@ -237,6 +237,8 @@ actor_rollout_ref:
+     temperature: 1.0
+     top_k: -1
+     top_p: 1
++    stop: null
++    bad_words: null
+     full_determinism: false
+     seed: 42
+     prompt_length: ${oc.select:data.max_prompt_length,512}
+diff --git a/verl/trainer/config/_generated_ppo_trainer.yaml b/verl/trainer/config/_generated_ppo_trainer.yaml
+index d763f281..835669ab 100644
+--- a/verl/trainer/config/_generated_ppo_trainer.yaml
++++ b/verl/trainer/config/_generated_ppo_trainer.yaml
+@@ -49,6 +49,7 @@ actor_rollout_ref:
+       qat:
+         _target_: verl.workers.config.QATEngineConfig
+         enable: false
++        backend: nvfp4
+         mode: w4a16
+         group_size: 16
+         ignore_patterns:
+@@ -57,6 +58,8 @@ actor_rollout_ref:
+         - re:.*mlp.gate$
+         activation_observer: static_minmax
+         quantization_config_path: null
++        edgerazor_config_path: null
++        edgerazor_quant_mode: null
+     _target_: verl.workers.config.FSDPActorConfig
+     rollout_n: ${oc.select:actor_rollout_ref.rollout.n,1}
+     strategy: fsdp
+@@ -224,6 +227,7 @@ actor_rollout_ref:
+       qat:
+         _target_: verl.workers.config.QATEngineConfig
+         enable: false
++        backend: nvfp4
+         mode: w4a16
+         group_size: 16
+         ignore_patterns:
+@@ -232,6 +236,8 @@ actor_rollout_ref:
+         - re:.*mlp.gate$
+         activation_observer: static_minmax
+         quantization_config_path: null
++        edgerazor_config_path: null
++        edgerazor_quant_mode: null
+     _target_: verl.workers.config.FSDPActorConfig
+     ulysses_sequence_parallel_size: ${oc.select:actor_rollout_ref.actor.ulysses_sequence_parallel_size,1}
+     entropy_from_logits_with_chunking: false
+@@ -246,6 +252,8 @@ actor_rollout_ref:
+     temperature: 1.0
+     top_k: -1
+     top_p: 1
++    stop: null
++    bad_words: null
+     full_determinism: false
+     seed: 42
+     prompt_length: ${oc.select:data.max_prompt_length,512}
+@@ -521,6 +529,7 @@ critic:
+     qat:
+       _target_: verl.workers.config.QATEngineConfig
+       enable: false
++      backend: nvfp4
+       mode: w4a16
+       group_size: 16
+       ignore_patterns:
+@@ -529,6 +538,8 @@ critic:
+       - re:.*mlp.gate$
+       activation_observer: static_minmax
+       quantization_config_path: null
++      edgerazor_config_path: null
++      edgerazor_quant_mode: null
+   _target_: verl.workers.config.FSDPCriticConfig
+   rollout_n: ${oc.select:actor_rollout_ref.rollout.n,1}
+   strategy: fsdp
+diff --git a/verl/trainer/config/_generated_ppo_veomni_trainer.yaml b/verl/trainer/config/_generated_ppo_veomni_trainer.yaml
+index ff6513cb..161f0f2b 100644
+--- a/verl/trainer/config/_generated_ppo_veomni_trainer.yaml
++++ b/verl/trainer/config/_generated_ppo_veomni_trainer.yaml
+@@ -247,6 +247,8 @@ actor_rollout_ref:
+     temperature: 1.0
+     top_k: -1
+     top_p: 1
++    stop: null
++    bad_words: null
+     full_determinism: false
+     seed: 42
+     prompt_length: ${oc.select:data.max_prompt_length,512}
+diff --git a/verl/trainer/config/engine/fsdp.yaml b/verl/trainer/config/engine/fsdp.yaml
+index a36fe8da..64d0a7fe 100644
+--- a/verl/trainer/config/engine/fsdp.yaml
++++ b/verl/trainer/config/engine/fsdp.yaml
+@@ -74,6 +74,9 @@ qat:
+   # Whether to enable QAT
+   enable: false
+ 
++  # QAT implementation: nvfp4 or edgerazor
++  backend: "nvfp4"
++
+   # Quantization mode: "w4a16" (weight-only). "w4a4" is experimental and not recommended.
+   mode: "w4a16"
+ 
+@@ -92,3 +95,7 @@ qat:
+ 
+   # Path to vLLM quantization config JSON file
+   quantization_config_path: null
++
++  # EdgeRazor fake-quant config and vLLM quant_mode
++  edgerazor_config_path: null
++  edgerazor_quant_mode: null
+diff --git a/verl/trainer/config/rollout/rollout.yaml b/verl/trainer/config/rollout/rollout.yaml
+index e27007b4..e789ce07 100644
+--- a/verl/trainer/config/rollout/rollout.yaml
++++ b/verl/trainer/config/rollout/rollout.yaml
+@@ -22,6 +22,12 @@ top_k: -1
+ # Top-p sampling parameter. Default 1.0.
+ top_p: 1
+ 
++# Optional stop strings forwarded to the inference engine.
++stop: null
++
++# Optional strings that the inference engine must not generate.
++bad_words: null
++
+ # Whether to enable full determinism for reproducibility in rollout.
+ # See https://pytorch.org/docs/stable/notes/randomness.html for details.
+ full_determinism: false
+diff --git a/verl/trainer/distillation/fsdp/losses.py b/verl/trainer/distillation/fsdp/losses.py
+index 602d3875..d41e8cb5 100644
+--- a/verl/trainer/distillation/fsdp/losses.py
++++ b/verl/trainer/distillation/fsdp/losses.py
+@@ -147,3 +147,75 @@ def compute_forward_kl_topk(
+         "overlap_count": overlap_count,
+         "overlap_token_advantage": overlap_token_advantage,
+     }
++
++
++def compute_reverse_kl_topk_overlap(
++    student_logits: torch.Tensor,
++    teacher_topk_log_probs: torch.Tensor,
++    teacher_topk_ids: torch.Tensor,
++    config: DistillationConfig,
++    data_format: str,
++) -> dict[str, torch.Tensor]:
++    """Compute reverse KL on the intersection of student and teacher top-k sets.
++
++    The two distributions are renormalized on their shared support before
++    computing KL(student || teacher). Positions with no shared token contribute
++    zero loss. This follows the overlap-only OPD ablation in arXiv:2604.13016.
++    """
++    del data_format
++    assert teacher_topk_log_probs.is_nested and teacher_topk_ids.is_nested
++    teacher_topk_log_probs = teacher_topk_log_probs.values().unsqueeze(0)
++    teacher_topk_ids = teacher_topk_ids.values().unsqueeze(0)
++
++    if get_ulysses_sequence_parallel_world_size() > 1:
++        teacher_topk_log_probs = slice_input_tensor(teacher_topk_log_probs, dim=1)
++        teacher_topk_ids = slice_input_tensor(teacher_topk_ids, dim=1)
++    assert teacher_topk_log_probs.shape[:2] == teacher_topk_ids.shape[:2] == student_logits.shape[:2]
++
++    student_log_probs = F.log_softmax(student_logits, dim=-1)
++    topk = teacher_topk_ids.shape[-1]
++    student_topk_ids = torch.topk(student_log_probs, k=topk, dim=-1).indices
++    student_on_teacher_log_probs = torch.gather(student_log_probs, dim=-1, index=teacher_topk_ids)
++
++    overlap_mask = (teacher_topk_ids.unsqueeze(-1) == student_topk_ids.unsqueeze(-2)).any(dim=-1)
++    overlap_count = overlap_mask.sum(dim=-1)
++    has_overlap = overlap_count > 0
++
++    student_mass = (student_on_teacher_log_probs.exp() * overlap_mask).sum(dim=-1)
++    teacher_mass = (teacher_topk_log_probs.exp() * overlap_mask).sum(dim=-1)
++
++    loss_config: DistillationLossConfig = config.distillation_loss
++    if loss_config.log_prob_min_clamp is not None:
++        student_on_teacher_log_probs = student_on_teacher_log_probs.clamp_min(loss_config.log_prob_min_clamp)
++        teacher_topk_log_probs = teacher_topk_log_probs.clamp_min(loss_config.log_prob_min_clamp)
++
++    # A fully masked row must remain finite during backward. Using -inf here
++    # produces (-inf) - (-inf) inside log-softmax; a later torch.where hides
++    # the NaN in forward but does not reliably stop it in a mixed-batch backward.
++    mask_fill_value = torch.finfo(torch.float32).min
++    student_overlap_logits = student_on_teacher_log_probs.float().masked_fill(~overlap_mask, mask_fill_value)
++    teacher_overlap_logits = teacher_topk_log_probs.float().masked_fill(~overlap_mask, mask_fill_value)
++    student_overlap_log_probs = student_overlap_logits - torch.logsumexp(
++        student_overlap_logits, dim=-1, keepdim=True
++    )
++    teacher_overlap_log_probs = teacher_overlap_logits - torch.logsumexp(
++        teacher_overlap_logits, dim=-1, keepdim=True
++    )
++
++    token_kl = student_overlap_log_probs.exp() * (student_overlap_log_probs - teacher_overlap_log_probs)
++    token_kl = torch.where(overlap_mask, token_kl, torch.zeros_like(token_kl))
++    distillation_losses = token_kl.sum(dim=-1)
++    distillation_losses = torch.where(has_overlap, distillation_losses, torch.zeros_like(distillation_losses))
++    overlap_token_advantage = torch.where(
++        has_overlap,
++        -distillation_losses / overlap_count.clamp_min(1),
++        torch.zeros_like(distillation_losses),
++    )
++
++    return {
++        "distillation_losses": distillation_losses,
++        "student_mass": student_mass,
++        "teacher_mass": teacher_mass,
++        "overlap_count": overlap_count,
++        "overlap_token_advantage": overlap_token_advantage,
++    }
+diff --git a/verl/trainer/distillation/losses.py b/verl/trainer/distillation/losses.py
+index 07df0850..b1549789 100644
+--- a/verl/trainer/distillation/losses.py
++++ b/verl/trainer/distillation/losses.py
+@@ -16,6 +16,7 @@ from dataclasses import dataclass, field
+ from typing import Any, Callable, Optional
+ 
+ import torch
++import torch.nn.functional as F
+ from tensordict import TensorDict
+ 
+ from verl.base_config import BaseConfig
+@@ -120,6 +121,49 @@ def compute_distillation_loss_range(
+     }
+ 
+ 
++def gate_distillation_loss_by_positive_advantage(
++    distillation_losses: torch.Tensor,
++    advantages: torch.Tensor,
++    response_mask: torch.Tensor,
++) -> tuple[torch.Tensor, torch.Tensor]:
++    """Keep direct distillation gradients only where task advantage is positive."""
++    if advantages.is_nested:
++        advantages = advantages.to_padded_tensor(0.0)
++    if response_mask.is_nested:
++        response_mask = response_mask.to_padded_tensor(False)
++    if distillation_losses.shape != advantages.shape or advantages.shape != response_mask.shape:
++        raise ValueError(
++            "positive-advantage gating requires matching loss, advantage, and response-mask shapes; "
++            f"got {distillation_losses.shape=}, {advantages.shape=}, {response_mask.shape=}"
++        )
++
++    valid_mask = response_mask.bool()
++    positive_mask = advantages > 0
++    gated_mask = valid_mask & positive_mask
++    gated_losses = distillation_losses * gated_mask.to(distillation_losses.dtype)
++    positive_fraction = gated_mask.sum().to(torch.float32) / valid_mask.sum().clamp_min(1)
++    return gated_losses, positive_fraction
++
++
++def gate_task_advantages_by_positive_advantage(
++    advantages: torch.Tensor,
++    response_mask: torch.Tensor,
++) -> tuple[torch.Tensor, torch.Tensor]:
++    """Remove negative task-PG updates while preserving reference-KL regularization."""
++    gated_advantages = advantages.clamp_min(0)
++    padded_advantages = advantages.to_padded_tensor(0.0) if advantages.is_nested else advantages
++    padded_response_mask = response_mask.to_padded_tensor(False) if response_mask.is_nested else response_mask
++    if padded_advantages.shape != padded_response_mask.shape:
++        raise ValueError(
++            "positive task-advantage gating requires matching advantage and response-mask shapes; "
++            f"got {padded_advantages.shape=}, {padded_response_mask.shape=}"
++        )
++
++    valid_mask = padded_response_mask.bool()
++    positive_fraction = ((padded_advantages > 0) & valid_mask).sum().to(torch.float32) / valid_mask.sum().clamp_min(1)
++    return gated_advantages, positive_fraction
++
++
+ def compute_topk_loss(
+     config: ActorConfig,
+     distillation_config: DistillationConfig,
+@@ -134,16 +178,25 @@ def compute_topk_loss(
+     - student_mass: (bsz, seqlen/cp_size)
+     - teacher_mass: (bsz, seqlen/cp_size)
+     """
++    loss_mode = distillation_config.distillation_loss.loss_mode
+     match config.strategy:
+         # VeOmni uses FSDP2 internally, so its loss computation is identical to FSDP.
+         case "fsdp" | "veomni":
+             import verl.trainer.distillation.fsdp.losses as fsdp_losses
+ 
+-            distillation_loss_fn = fsdp_losses.compute_forward_kl_topk
++            if loss_mode == "forward_kl_topk":
++                distillation_loss_fn = fsdp_losses.compute_forward_kl_topk
++            elif loss_mode == "reverse_kl_topk_overlap":
++                distillation_loss_fn = fsdp_losses.compute_reverse_kl_topk_overlap
++            else:
++                raise NotImplementedError(f"Unsupported top-k distillation loss for FSDP: {loss_mode}")
+         case "megatron":
+             import verl.trainer.distillation.megatron.losses as megatron_losses
+ 
+-            distillation_loss_fn = megatron_losses.compute_forward_kl_topk
++            if loss_mode == "forward_kl_topk":
++                distillation_loss_fn = megatron_losses.compute_forward_kl_topk
++            else:
++                raise NotImplementedError(f"Unsupported top-k distillation loss for Megatron: {loss_mode}")
+         case _:
+             raise NotImplementedError(f"Unsupported strategy: {config.strategy=}")
+ 
+@@ -207,10 +260,29 @@ def distillation_ppo_loss(
+     # Called as final policy loss
+     distillation_loss_config = distillation_config.distillation_loss
+     distill_loss, distill_metrics = distillation_loss(config, distillation_config, model_output, data)
+-    policy_loss, policy_metrics = ppo_loss(config, model_output, data, dp_group)
++    policy_data = data
++    positive_task_fraction = None
++    if distillation_loss_config.positive_task_advantage_only:
++        policy_data = data.clone()
++        policy_data["advantages"], positive_task_fraction = gate_task_advantages_by_positive_advantage(
++            advantages=data["advantages"],
++            response_mask=data["response_mask"],
++        )
++    policy_loss, policy_metrics = ppo_loss(
++        config,
++        model_output,
++        policy_data,
++        dp_group,
++        policy_gradient_coef=distillation_loss_config.task_policy_loss_coef,
++    )
+     if not distillation_loss_config.use_task_rewards:
+         policy_loss = 0.0
+ 
++    if positive_task_fraction is not None:
++        policy_metrics["actor/positive_task_advantage_fraction"] = Metric(
++            AggregationType.MEAN, positive_task_fraction
++        )
++
+     # Combine distillation with policy loss
+     policy_metrics.update(distill_metrics)
+     distillation_loss_coef = (
+@@ -254,6 +326,16 @@ def distillation_loss(
+         # clamping min is for k1 loss which can be negative
+         distillation_losses = distillation_losses.clamp(min=-loss_config.loss_max_clamp, max=loss_config.loss_max_clamp)
+ 
++    if loss_config.positive_advantage_only:
++        distillation_losses, positive_fraction = gate_distillation_loss_by_positive_advantage(
++            distillation_losses=distillation_losses,
++            advantages=data["advantages"],
++            response_mask=response_mask,
++        )
++        distillation_metrics["distillation/positive_advantage_fraction"] = Metric(
++            AggregationType.MEAN, positive_fraction
++        )
++
+     if loss_config.use_policy_gradient:
+         # Use negative distillation loss as reward, as done by https://thinkingmachines.ai/blog/on-policy-distillation/.
+         policy_loss_fn = get_policy_loss_fn(loss_config.policy_loss_mode)
+@@ -356,6 +438,130 @@ def compute_forward_kl_topk(
+     return distillation_losses, distillation_metrics
+ 
+ 
++@register_distillation_loss(DistillationLossSettings(names=["reverse_kl_topk_overlap"], use_topk=True))  # type: ignore[arg-type]
++def compute_reverse_kl_topk_overlap(
++    config: ActorConfig,
++    distillation_config: DistillationConfig,
++    model_output: dict,
++    data: TensorDict,
++) -> tuple[torch.Tensor, dict[str, Any]]:
++    """Collect direct reverse-KL losses computed on shared top-k support."""
++    return compute_forward_kl_topk(
++        config=config,
++        distillation_config=distillation_config,
++        model_output=model_output,
++        data=data,
++    )
++
++
++@register_distillation_loss(DistillationLossSettings(names=["teacher_forcing_nll"], use_estimator=True))  # type: ignore[arg-type]
++def compute_teacher_forcing_nll(
++    config: ActorConfig,
++    distillation_config: DistillationConfig,
++    model_output,
++    data: TensorDict,
++) -> tuple[torch.Tensor, dict[str, Any]]:
++    """Compute token NLL on a fixed reference trajectory.
++
++    This mode is intended for trajectories supplied by ``teacher_forcing_agent``.
++    Unlike the sampled KL estimators below, its direct gradient is the standard
++    behavior-cloning gradient on each reference response token.
++    """
++    del config, distillation_config
++    student_log_probs = no_padding_2_padding(model_output["log_probs"], data)
++    if data["response_mask"].is_nested:
++        response_mask_bool = data["response_mask"].bool().to_padded_tensor(False)
++    else:
++        response_mask_bool = data["response_mask"].bool()
++    assert student_log_probs.shape == response_mask_bool.shape
++
++    token_nll = -student_log_probs
++    metrics = {
++        "distillation/token_nll": Metric(AggregationType.MEAN, token_nll[response_mask_bool].mean()),
++    }
++    return token_nll, metrics
++
++
++def _paired_session_ids(data: TensorDict, *, device: torch.device) -> torch.Tensor:
++    if "session_id" not in data:
++        raise ValueError("paired_dpo requires session_id in the training batch")
++    raw_session_ids = data["session_id"]
++    if isinstance(raw_session_ids, torch.Tensor):
++        session_ids = raw_session_ids.to(device=device, dtype=torch.long).reshape(-1)
++    else:
++        session_ids = torch.tensor(
++            [
++                int(value.item()) if hasattr(value, "item") else int(value)
++                for value in list(raw_session_ids)
++            ],
++            device=device,
++            dtype=torch.long,
++        )
++    if session_ids.numel() % 2:
++        raise ValueError(f"paired_dpo requires an even local batch, got {session_ids.numel()}")
++    expected = torch.tensor([0, 1], device=device).repeat(session_ids.numel() // 2)
++    if not torch.equal(session_ids, expected):
++        raise ValueError(
++            "paired_dpo requires adjacent chosen/rejected sessions ordered as [0, 1]; "
++            f"got {session_ids.tolist()}"
++        )
++    return session_ids
++
++
++@register_distillation_loss(DistillationLossSettings(names=["paired_dpo"], use_estimator=True))  # type: ignore[arg-type]
++def compute_paired_dpo(
++    config: ActorConfig,
++    distillation_config: DistillationConfig,
++    model_output,
++    data: TensorDict,
++) -> tuple[torch.Tensor, dict[str, Any]]:
++    """Compute reference-corrected DPO over adjacent fixed trajectory pairs.
++
++    Session 0 is the execution-verified FP response and session 1 is the
++    matched failing QAD response. Sequence log probabilities use the standard
++    DPO sum reduction. The pair loss is copied to both rows so the existing
++    sequence-mean token aggregator produces exactly the mean pair loss.
++    """
++    del config
++    student_log_probs = no_padding_2_padding(model_output["log_probs"], data)
++    response_mask = data["response_mask"]
++    if response_mask.is_nested:
++        response_mask = response_mask.to_padded_tensor(False)
++    response_mask_bool = response_mask.bool()
++    if "ref_log_prob" not in data:
++        raise ValueError(
++            "paired_dpo requires a frozen reference policy; set actor_rollout_ref.actor.use_kl_loss=True"
++        )
++    ref_log_probs = data["ref_log_prob"]
++    if ref_log_probs.is_nested:
++        ref_log_probs = ref_log_probs.to_padded_tensor(0.0)
++    assert student_log_probs.shape == ref_log_probs.shape == response_mask_bool.shape
++    _paired_session_ids(data, device=student_log_probs.device)
++
++    mask = response_mask_bool.to(student_log_probs.dtype)
++    policy_sequence_logps = (student_log_probs * mask).sum(dim=-1)
++    reference_sequence_logps = (ref_log_probs * mask).sum(dim=-1)
++    policy_logratios = policy_sequence_logps[0::2] - policy_sequence_logps[1::2]
++    reference_logratios = reference_sequence_logps[0::2] - reference_sequence_logps[1::2]
++    preference_logits = distillation_config.distillation_loss.preference_beta * (
++        policy_logratios - reference_logratios
++    )
++    pair_losses = -F.logsigmoid(preference_logits)
++
++    per_sequence_losses = pair_losses.repeat_interleave(2)
++    token_losses = per_sequence_losses.unsqueeze(-1).expand_as(student_log_probs)
++    metrics = {
++        "distillation/dpo_pair_loss": Metric(AggregationType.MEAN, pair_losses.mean()),
++        "distillation/dpo_margin": Metric(AggregationType.MEAN, preference_logits.mean()),
++        "distillation/dpo_preference_accuracy": Metric(
++            AggregationType.MEAN, (preference_logits > 0).float().mean()
++        ),
++        "distillation/dpo_policy_logratio": Metric(AggregationType.MEAN, policy_logratios.mean()),
++        "distillation/dpo_reference_logratio": Metric(AggregationType.MEAN, reference_logratios.mean()),
++    }
++    return token_losses, metrics
++
++
+ @register_distillation_loss(
+     DistillationLossSettings(names=["kl", "k1", "abs", "mse", "k2", "low_var_kl", "k3"], use_estimator=True)
+ )  # type: ignore[arg-type]
+diff --git a/verl/trainer/ppo/v1/agent_loop_tq.py b/verl/trainer/ppo/v1/agent_loop_tq.py
+index 5e147eef..888f26d4 100644
+--- a/verl/trainer/ppo/v1/agent_loop_tq.py
++++ b/verl/trainer/ppo/v1/agent_loop_tq.py
+@@ -29,6 +29,7 @@ from verl.experimental.agent_loop import (
+     AgentLoopManager,
+     AgentLoopOutput,
+     AgentLoopWorker,
++    build_rollout_sampling_params,
+     get_trajectory_info,
+ )
+ from verl.utils.ray_utils import auto_await
+@@ -56,13 +57,7 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
+         validate = batch["validate"] if "validate" in batch else False
+         batch.pop("validate", None)
+         config = self.config.actor_rollout_ref.rollout
+-        sampling_params = dict(
+-            temperature=config.temperature,
+-            top_p=config.top_p,
+-            top_k=config.top_k,
+-            repetition_penalty=1.0,
+-            logprobs=config.calculate_log_probs,
+-        )
++        sampling_params = build_rollout_sampling_params(config)
+ 
+         # override sampling params for validation
+         if validate:
+diff --git a/verl/trainer/ppo/v1/trainer_base.py b/verl/trainer/ppo/v1/trainer_base.py
+index b40c4853..50d0fe14 100644
+--- a/verl/trainer/ppo/v1/trainer_base.py
++++ b/verl/trainer/ppo/v1/trainer_base.py
+@@ -79,7 +79,12 @@ from verl.utils.fs import copy_to_local
+ from verl.utils.import_utils import load_extern_type
+ from verl.utils.metric import reduce_metrics
+ from verl.utils.py_functional import rename_dict
+-from verl.utils.seqlen_balancing import calculate_workload, get_seqlen_balanced_partitions, log_seqlen_unbalance
++from verl.utils.seqlen_balancing import (
++    calculate_workload,
++    get_group_balanced_partitions,
++    get_seqlen_balanced_partitions,
++    log_seqlen_unbalance,
++)
+ from verl.utils.tracking import Tracking, ValidationGenerationsLogger
+ from verl.workers.config import CriticConfig, DistillationConfig
+ from verl.workers.engine_workers import ActorRolloutRefWorker, TrainingWorker, TrainingWorkerConfig
+@@ -98,6 +103,37 @@ logger = logging.getLogger(__name__)
+ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "INFO"))
+ 
+ 
++def paired_dpo_batch_layout(keys: list[str], tags: list[dict], dp_size: int) -> tuple[list[int], list[list[int]]]:
++    """Order fixed preference sessions and keep every pair on one DP rank."""
++    parsed = []
++    for index, key in enumerate(keys):
++        parts = key.rsplit("_", 2)
++        if len(parts) != 3:
++            raise ValueError(f"paired_dpo received malformed trajectory key: {key}")
++        uid, raw_session_id, raw_output_index = parts
++        parsed.append((uid, int(raw_session_id), int(raw_output_index), index))
++
++    order = [item[3] for item in sorted(parsed)]
++    ordered = [parsed[index] for index in order]
++    groups: dict[str, list[tuple[int, int]]] = {}
++    for uid, session_id, output_index, _ in ordered:
++        groups.setdefault(uid, []).append((session_id, output_index))
++    malformed = {uid: values for uid, values in groups.items() if values != [(0, 0), (1, 0)]}
++    if malformed:
++        raise ValueError(f"paired_dpo requires exactly sessions [(0, 0), (1, 0)] per uid: {malformed}")
++    if len(groups) % dp_size:
++        raise ValueError(f"paired_dpo pair count {len(groups)} must divide evenly across dp_size={dp_size}")
++
++    ordered_seqlens = [int(tags[index]["seq_len"]) for index in order]
++    ordered_uids = [item[0] for item in ordered]
++    partitions = get_group_balanced_partitions(
++        seqlen_list=ordered_seqlens,
++        uid_list=ordered_uids,
++        k_partitions=dp_size,
++    )
++    return order, partitions
++
++
+ class PPOTrainer(ABC):
+     """Base class for PPO trainer.
+ 
+@@ -511,6 +547,12 @@ class PPOTrainer(ABC):
+         # Used for multimodal LLM, could be None
+         self.processor = hf_processor(local_path, trust_remote_code=trust_remote_code, use_fast=True)
+ 
++        custom_chat_template = self.config.actor_rollout_ref.model.get("custom_chat_template")
++        if custom_chat_template is not None:
++            self.tokenizer.chat_template = custom_chat_template
++            if self.processor is not None:
++                self.processor.chat_template = custom_chat_template
++
+     def _init_dataloader(self):
+         """Initialize train and validate dataloader."""
+         self.train_dataset = create_rl_dataset(
+@@ -1204,14 +1246,29 @@ class PPOTrainer(ABC):
+             dp_rank_mapping = worker_group._dispatch_info[role]
+         dp_size = max(dp_rank_mapping) + 1
+ 
++        paired_dpo = (
++            self.distillation_config is not None
++            and self.distillation_config.distillation_loss.loss_mode == "paired_dpo"
++        )
++
+         # Upsampling the batch with padding sequences
+         batch_multiple = self._get_required_batch_multiple(dp_size)
+-        batch = upsample_batch_to_divisible_size(batch, batch_multiple, self.tokenizer.eos_token_id)
++        if paired_dpo:
++            if len(batch) % batch_multiple:
++                raise ValueError(
++                    f"paired_dpo batch size {len(batch)} must already be divisible by {batch_multiple}; "
++                    "padding would create an invalid preference pair"
++                )
++            order, global_partition_lst = paired_dpo_batch_layout(batch.keys, batch.tags, dp_size)
++            batch.reorder(order)
++        else:
++            batch = upsample_batch_to_divisible_size(batch, batch_multiple, self.tokenizer.eos_token_id)
+         global_seqlen_lst = torch.tensor([tag["seq_len"] for tag in batch.tags], dtype=torch.int64)
+         workload_lst = calculate_workload(global_seqlen_lst)
+ 
+         # reorder based on index. The data will be automatically equally partitioned by dispatch function
+-        global_partition_lst = get_seqlen_balanced_partitions(workload_lst, k_partitions=dp_size, equal_size=True)
++        if not paired_dpo:
++            global_partition_lst = get_seqlen_balanced_partitions(workload_lst, k_partitions=dp_size, equal_size=True)
+         batch.reorder([j for partition in global_partition_lst for j in partition])
+         global_balance_stats = log_seqlen_unbalance(
+             seqlen_list=global_seqlen_lst.tolist(), partitions=global_partition_lst, prefix=logging_prefix
+@@ -1434,6 +1491,11 @@ class PPOTrainer(ABC):
+             "dataloader_kwargs": {"shuffle": self.config.actor_rollout_ref.actor.shuffle},
+             "temperature": self.config.actor_rollout_ref.rollout.temperature,
+         }
++        if (
++            self.distillation_config is not None
++            and self.distillation_config.distillation_loss.loss_mode == "paired_dpo"
++        ):
++            extra_info["force_group_size"] = 2
+         batch.extra_info.update(extra_info)
+ 
+         output: TensorDict = self.actor_rollout_wg.update_actor(batch)
+diff --git a/verl/utils/debug/metrics.py b/verl/utils/debug/metrics.py
+index 706a7f97..229bac1e 100644
+--- a/verl/utils/debug/metrics.py
++++ b/verl/utils/debug/metrics.py
+@@ -20,6 +20,16 @@ from verl.protocol import DataProto
+ logger = logging.getLogger(__file__)
+ 
+ 
++def _invalid_rollout_metrics() -> dict:
++    return {
++        "training/rollout_probs_diff_valid": 0,
++        "training/rollout_probs_diff_max": float("nan"),
++        "training/rollout_probs_diff_mean": float("nan"),
++        "training/rollout_probs_diff_std": float("nan"),
++        "training/rollout_actor_probs_pearson_corr": float("nan"),
++    }
++
++
+ def calculate_token_list_diff(tensor1: torch.Tensor, tensor2: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+     # verify inputs
+     if tensor1.numel() == 0 or tensor2.numel() == 0:
+@@ -80,6 +90,10 @@ def calculate_debug_metrics(data: DataProto) -> dict:
+             "training/rollout_actor_probs_pearson_corr": logprob's pearson corrcoef of rollout vs. actor, reference to https://arxiv.org/pdf/2506.13585
+     """
+ 
++    if "rollout_log_probs" not in data.batch:
++        logger.debug("rollout_log_probs not found; skipping rollout-vs-actor diagnostics")
++        return _invalid_rollout_metrics()
++
+     rollout_old_log_probs = data.batch["rollout_log_probs"]
+     actor_old_log_probs = data.batch["old_log_probs"]
+     if "response_mask" in data.batch:
+@@ -102,13 +116,7 @@ def calculate_debug_metrics(data: DataProto) -> dict:
+     # check if there are any valid tokens before computing metrics
+     if not response_mask_bool.any():
+         logger.warning("response_mask is all False, returning default metrics")
+-        return {
+-            "training/rollout_probs_diff_valid": 0,
+-            "training/rollout_probs_diff_max": float("nan"),
+-            "training/rollout_probs_diff_mean": float("nan"),
+-            "training/rollout_probs_diff_std": float("nan"),
+-            "training/rollout_actor_probs_pearson_corr": float("nan"),
+-        }
++        return _invalid_rollout_metrics()
+ 
+     pearson_corrcoef = pearson_correlation_coefficient(actor_probs, rollout_probs, response_mask_bool)
+     rollout_probs_diff = calculate_log_prob_diff(actor_probs, rollout_probs, response_mask_bool)
+diff --git a/verl/utils/qat/core.py b/verl/utils/qat/core.py
+index 9f3a1fbe..03afdcab 100644
+--- a/verl/utils/qat/core.py
++++ b/verl/utils/qat/core.py
+@@ -32,11 +32,14 @@ class QATConfig(BaseConfig):
+     """Unified configuration for QAT (Quantization-Aware Training)."""
+ 
+     enable: bool = False
++    backend: str = "nvfp4"
+     mode: str = "w4a16"
+     group_size: int = 16
+     ignore_patterns: list[str] = field(default_factory=lambda: ["lm_head", "embed_tokens", "re:.*mlp.gate$"])
+     activation_observer: str = "static_minmax"
+     quantization_config_path: Optional[str] = None
++    edgerazor_config_path: Optional[str] = None
++    edgerazor_quant_mode: Optional[str] = None
+ 
+ 
+ def load_quantization_config(qat_config: QATConfig) -> dict[str, Any]:
+diff --git a/verl/utils/qat/edgerazor.py b/verl/utils/qat/edgerazor.py
+new file mode 100644
+index 00000000..384c2c07
+--- /dev/null
++++ b/verl/utils/qat/edgerazor.py
+@@ -0,0 +1,78 @@
++"""EdgeRazor W/A quantization adapters for FSDP training and vLLM rollout."""
++
++from __future__ import annotations
++
++import logging
++from pathlib import Path
++from typing import Any
++
++import torch.nn as nn
++
++logger = logging.getLogger(__name__)
++
++
++def _require_edgerazor():
++    try:
++        import edgerazor
++    except ImportError as exc:
++        raise ImportError(
++            "EdgeRazor is required for qat.backend=edgerazor. Add "
++            "<EdgeRazor>/src to PYTHONPATH; installing into the verl environment is not required."
++        ) from exc
++    return edgerazor
++
++
++def apply_edgerazor_qat(model: nn.Module, config_path: str) -> nn.Module:
++    """Apply EdgeRazor fake W/A quantization while retaining latent parameters."""
++    if not config_path:
++        raise ValueError("qat.edgerazor_config_path is required for the EdgeRazor backend")
++    path = Path(config_path)
++    if not path.is_file():
++        raise FileNotFoundError(f"EdgeRazor QAT config does not exist: {path}")
++
++    edgerazor = _require_edgerazor()
++    qat = edgerazor.QAT(path)
++    model = qat.quantize(model)
++
++    from edgerazor.qat import QEmbedding, QLinear
++
++    linear_count = sum(isinstance(module, QLinear) for module in model.modules())
++    embedding_count = sum(isinstance(module, QEmbedding) for module in model.modules())
++    if linear_count == 0:
++        raise RuntimeError("EdgeRazor selected no Linear modules for QAT")
++    logger.info(
++        "Applied EdgeRazor QAT: %d Linear modules and %d Embedding modules",
++        linear_count,
++        embedding_count,
++    )
++    return model
++
++
++def build_vllm_quantization_config(qat_config: Any) -> dict[str, Any]:
++    """Build the standard HF quantization_config consumed by vLLM 0.11."""
++    quant_mode = getattr(qat_config, "edgerazor_quant_mode", None)
++    if not quant_mode:
++        raise ValueError("qat.edgerazor_quant_mode is required for EdgeRazor vLLM rollout")
++
++    _require_edgerazor()
++    from edgerazor.vllm.quant_mode_parse import QuantModeConfig
++
++    parsed = QuantModeConfig(quant_mode)
++    return {
++        "quant_method": "edgerazor",
++        "quant_mode": quant_mode,
++        "weight_bits": parsed.weight_bits,
++        "activation_bits": parsed.activation_bits,
++        # EdgeRazor's vLLM plugin currently leaves the real KV cache unquantized.
++        "kv_cache_bits": 16,
++        "backend": "py",
++    }
++
++
++def register_vllm_plugin() -> None:
++    """Register the source-tree plugin without modifying the conda environment."""
++    _require_edgerazor()
++    from edgerazor.vllm import register
++
++    if not register():
++        raise RuntimeError("Failed to register the EdgeRazor vLLM quantization plugin")
+diff --git a/verl/workers/config/distillation.py b/verl/workers/config/distillation.py
+index b58f8bcc..f3448529 100644
+--- a/verl/workers/config/distillation.py
++++ b/verl/workers/config/distillation.py
+@@ -50,6 +50,18 @@ class DistillationLossConfig(BaseConfig):
+         by https://thinkingmachines.ai/blog/on-policy-distillation/. Recommended to use loss_mode=k1.
+         Otherwise, distillation loss is directly backpropagated as a supervised loss,
+         as in https://arxiv.org/abs/2306.13649. Recommended to use loss_mode=k3 or forward_kl_topk.
++    positive_advantage_only (bool):
++        Whether to backpropagate direct distillation loss only on tokens whose task-reward
++        advantage is positive. This keeps failed on-policy prefixes out of supervised FKL.
++    positive_task_advantage_only (bool):
++        Whether to clamp negative task-reward advantages to zero before computing the PPO
++        policy-gradient term. Reference-model KL regularization remains enabled.
++    task_policy_loss_coef (float):
++        Coefficient applied only to the task-reward policy-gradient term. Entropy and
++        reference-model KL regularization keep their actor-level coefficients.
++    preference_beta (float):
++        Temperature applied to the policy-versus-reference log-ratio margin for
++        paired DPO trajectories.
+     policy_loss_mode (str):
+         Name of the policy loss to use when use_policy_gradient is true.
+     clip_ratio (float):
+@@ -82,6 +94,10 @@ class DistillationLossConfig(BaseConfig):
+     chunked_topk_chunk_size: int = 4096
+ 
+     use_policy_gradient: bool = True
++    positive_advantage_only: bool = False
++    positive_task_advantage_only: bool = False
++    task_policy_loss_coef: float = 1.0
++    preference_beta: float = 0.1
+     policy_loss_mode: str = "vanilla"
+     clip_ratio: float = 0.2
+     clip_ratio_low: float = 0.2
+@@ -109,9 +125,9 @@ class DistillationLossConfig(BaseConfig):
+                 f"but got {self.policy_loss_mode}."
+             )
+ 
+-        if self.use_policy_gradient and self.loss_mode == "forward_kl_topk":
++        if self.use_policy_gradient and self.loss_mode in {"forward_kl_topk", "reverse_kl_topk_overlap"}:
+             print(
+-                "WARNING: forward_kl_topk is most effective as a supervised distillation loss "
++                f"WARNING: {self.loss_mode} is most effective as a supervised distillation loss "
+                 "(use_policy_gradient=False). With policy gradient, the update uses only the sampled"
+                 " token's logprob ∇logπ(a), so the top-k distributional signal (how non-sampled logits "
+                 "should move) is largely unused."
+@@ -123,6 +139,24 @@ class DistillationLossConfig(BaseConfig):
+                 " wrt model weights does not depend on teacher log probabilities."
+             )
+ 
++        if self.use_policy_gradient and self.loss_mode == "teacher_forcing_nll":
++            raise ValueError("teacher_forcing_nll must be directly backpropagated with use_policy_gradient=False.")
++
++        if self.use_policy_gradient and self.loss_mode == "paired_dpo":
++            raise ValueError("paired_dpo must be directly backpropagated with use_policy_gradient=False.")
++
++        if self.positive_advantage_only and self.use_policy_gradient:
++            raise ValueError("positive_advantage_only requires directly backpropagated distillation loss.")
++
++        if self.positive_task_advantage_only and not self.use_task_rewards:
++            raise ValueError("positive_task_advantage_only requires use_task_rewards=True.")
++
++        if self.task_policy_loss_coef < 0:
++            raise ValueError("task_policy_loss_coef must be non-negative.")
++
++        if self.preference_beta <= 0:
++            raise ValueError("preference_beta must be positive.")
++
+ 
+ @dataclass
+ class DistillationTeacherModelConfig(BaseConfig):
+diff --git a/verl/workers/config/engine.py b/verl/workers/config/engine.py
+index 2c3a8db5..5d1512e8 100644
+--- a/verl/workers/config/engine.py
++++ b/verl/workers/config/engine.py
+@@ -131,19 +131,25 @@ class QATEngineConfig(BaseConfig):
+ 
+     Args:
+         enable (bool): Whether to enable QAT, default False
++        backend (str): QAT implementation, "nvfp4" or "edgerazor"
+         mode (str): Quantization mode, "w4a16" or "w4a4", default "w4a16"
+         group_size (int): Group size for blockwise quantization, default 16
+         ignore_patterns (list[str]): Module name patterns to exclude from quantization
+         activation_observer (str): Observer strategy for activation global_scale (W4A4 only)
+         quantization_config_path (Optional[str]): Path to quantization config JSON for vLLM
++        edgerazor_config_path (Optional[str]): Path to EdgeRazor QAT YAML/JSON
++        edgerazor_quant_mode (Optional[str]): EdgeRazor quant_mode used by vLLM
+     """
+ 
+     enable: bool = False
++    backend: str = "nvfp4"
+     mode: str = "w4a16"
+     group_size: int = 16
+     ignore_patterns: list[str] = field(default_factory=lambda: ["lm_head", "embed_tokens", "re:.*mlp.gate$"])
+     activation_observer: str = "static_minmax"
+     quantization_config_path: Optional[str] = None
++    edgerazor_config_path: Optional[str] = None
++    edgerazor_quant_mode: Optional[str] = None
+ 
+ 
+ @dataclass
+@@ -241,6 +247,7 @@ class FSDPEngineConfig(EngineConfig):
+         mixed_precision (Optional[dict[str, Any]]): Mixed precision configuration for FSDP, default None
+         dtype (str): Mixed precision training param dtype, default "bfloat16"
+         qat (QATEngineConfig): QAT configuration, default disabled
++        trainable_param_patterns (list[str]): Optional regex allowlist for trainable parameter names.
+     """
+ 
+     # ulysses_sequence_parallel_size is mutable for backward compatibility
+@@ -262,6 +269,7 @@ class FSDPEngineConfig(EngineConfig):
+     entropy_checkpointing: bool = False
+     strategy: str = "fsdp"
+     qat: QATEngineConfig = field(default_factory=QATEngineConfig)
++    trainable_param_patterns: list[str] = field(default_factory=list)
+ 
+     def __post_init__(self):
+         super().__post_init__()
+diff --git a/verl/workers/config/rollout.py b/verl/workers/config/rollout.py
+index 74b2f755..158271e2 100644
+--- a/verl/workers/config/rollout.py
++++ b/verl/workers/config/rollout.py
+@@ -166,6 +166,8 @@ class RolloutConfig(BaseConfig):
+     do_sample: bool = True
+     n: int = 1
+     repetition_penalty: float = 1.0
++    stop: Optional[list[str]] = None
++    bad_words: Optional[list[str]] = None
+ 
+     # Whether to enable full determinism for reproducibility.
+     full_determinism: bool = False
+diff --git a/verl/workers/engine/fsdp/transformer_impl.py b/verl/workers/engine/fsdp/transformer_impl.py
+index b68944a6..6004a261 100644
+--- a/verl/workers/engine/fsdp/transformer_impl.py
++++ b/verl/workers/engine/fsdp/transformer_impl.py
+@@ -18,6 +18,7 @@ The concrete Engine implementation using PyTorch FullyShardedDataParallel (FSDP)
+ import gc
+ import logging
+ import os
++import re
+ import warnings
+ from contextlib import nullcontext
+ from typing import Callable, ContextManager, Optional
+@@ -82,6 +83,30 @@ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
+ device_name = get_device_name()
+ 
+ 
++def set_trainable_param_patterns(module: torch.nn.Module, patterns: list[str]) -> tuple[int, int]:
++    """Freeze parameters outside a regex allowlist and return trainable counts."""
++    compiled = [re.compile(pattern) for pattern in patterns]
++    matched_names = []
++    trainable_numel = 0
++    total_numel = 0
++    for name, parameter in module.named_parameters():
++        trainable = any(pattern.search(name) for pattern in compiled)
++        parameter.requires_grad_(trainable)
++        total_numel += parameter.numel()
++        if trainable:
++            matched_names.append(name)
++            trainable_numel += parameter.numel()
++    if not matched_names:
++        raise ValueError(f"trainable_param_patterns matched no parameters: {patterns}")
++    logger.info(
++        "Trainable parameter allowlist matched %d tensors (%d/%d parameters)",
++        len(matched_names),
++        trainable_numel,
++        total_numel,
++    )
++    return len(matched_names), trainable_numel
++
++
+ class FSDPEngine(BaseEngine):
+     """
+     Concrete Engine implementation using PyTorch FullyShardedDataParallel (FSDP).
+@@ -151,8 +176,14 @@ class FSDPEngine(BaseEngine):
+         # QAT (Quantization-Aware Training)
+         self._qat_config = getattr(self.engine_config, "qat", None)
+         self._qat_enabled = self._qat_config is not None and getattr(self._qat_config, "enable", False)
++        self._qat_backend = getattr(self._qat_config, "backend", "nvfp4") if self._qat_enabled else None
+         if self._qat_enabled:
+-            logger.info(f"QAT enabled: mode={self._qat_config.mode}, group_size={self._qat_config.group_size}")
++            logger.info(
++                "QAT enabled: backend=%s, mode=%s, group_size=%s",
++                self._qat_backend,
++                self._qat_config.mode,
++                self._qat_config.group_size,
++            )
+ 
+         if self.engine_config.entropy_from_logits_with_chunking:
+             entropy_from_logits = verl_F.entropy_from_logits_with_chunking
+@@ -511,6 +542,13 @@ class FSDPEngine(BaseEngine):
+ 
+     def _apply_qat(self, module):
+         """Apply QAT transformations to the model before FSDP wrapping."""
++        if self._qat_backend == "edgerazor":
++            from verl.utils.qat.edgerazor import apply_edgerazor_qat
++
++            return apply_edgerazor_qat(module, self._qat_config.edgerazor_config_path)
++        if self._qat_backend != "nvfp4":
++            raise ValueError(f"Unsupported QAT backend: {self._qat_backend}")
++
+         from verl.utils.qat.core import apply_qat, enable_qat_fuse
+ 
+         module = apply_qat(
+@@ -570,10 +608,19 @@ class FSDPEngine(BaseEngine):
+         if self._is_lora:
+             module = self._build_lora_module(module)
+ 
+-        # Apply QAT before FSDP wrapping (training only)
+-        if self._qat_enabled and not self.engine_config.forward_only:
++        # Forward-only reference policies may also need fake quantization so
++        # their KL anchor matches the actor's initial quantized behavior.
++        if self._qat_enabled:
+             module = self._apply_qat(module)
+ 
++        trainable_patterns = getattr(self.engine_config, "trainable_param_patterns", [])
++        if trainable_patterns and not self.engine_config.forward_only:
++            if self.engine_config.strategy == "fsdp" and not self.engine_config.use_orig_params:
++                raise ValueError("trainable_param_patterns requires fsdp_config.use_orig_params=True for FSDP1")
++            tensor_count, parameter_count = set_trainable_param_patterns(module, list(trainable_patterns))
++            if self.rank == 0:
++                print(f"Trainable parameter allowlist: {tensor_count} tensors, {parameter_count} parameters")
++
+         # Synchronize all distributed processes before proceeding
+         torch.distributed.barrier()
+         if self.rank == 0:
+@@ -724,7 +771,7 @@ class FSDPEngine(BaseEngine):
+             else:
+                 self.optimizer.step()
+ 
+-        if self._qat_enabled:
++        if self._qat_enabled and self._qat_backend == "nvfp4":
+             from verl.utils.qat.core import invalidate_all_scales
+ 
+             invalidate_all_scales(self.module)
+@@ -868,7 +915,7 @@ class FSDPEngine(BaseEngine):
+                 for name, param in params.items()
+             )
+ 
+-        if self._qat_enabled:
++        if self._qat_enabled and self._qat_backend == "nvfp4":
+             from verl.utils.qat.quantizer import QATQuantizer
+             from verl.utils.torch_dtypes import PrecisionType
+ 
+diff --git a/verl/workers/rollout/vllm_rollout/utils.py b/verl/workers/rollout/vllm_rollout/utils.py
+index cd8df052..97e005ba 100644
+--- a/verl/workers/rollout/vllm_rollout/utils.py
++++ b/verl/workers/rollout/vllm_rollout/utils.py
+@@ -175,6 +175,7 @@ class vLLMColocateWorkerExtension:
+         quant_config = getattr(vllm_config, "quant_config", None) if vllm_config else None
+         _is_qat_model = getattr(quant_config, "quant_format", None) == "nvfp4-pack-quantized"
+         _is_modelopt_qat = type(quant_config).__name__ == "ModelOptNvFp4Config"
++        _is_edgerazor_qat = type(quant_config).__name__ == "EdgeRazorConfig"
+         if _is_qat_model:
+             from verl.utils.qat import apply_qat_patches
+ 
+@@ -197,6 +198,7 @@ class vLLMColocateWorkerExtension:
+         instance = super().__new__(cls)
+         instance._is_qat_model = _is_qat_model
+         instance._is_modelopt_qat = _is_modelopt_qat
++        instance._is_edgerazor_qat = _is_edgerazor_qat
+         return instance
+ 
+     def _get_drafter_model(self):
+@@ -256,7 +258,13 @@ class vLLMColocateWorkerExtension:
+             self.model_runner.vllm_config
+         )
+ 
+-        if self._is_qat_model:
++        if self._is_edgerazor_qat:
++            from edgerazor.vllm import prepare_for_weight_reload
++
++            for model in self._iter_all_models():
++                prepared = prepare_for_weight_reload(model, device=self.device)
++                logger.info("EdgeRazor: prepared %d layers for weight reload", prepared)
++        elif self._is_qat_model:
+             # QAT (compressed-tensors): Prepare for weight loading BEFORE receiving any buckets
+             from verl.utils.qat import prepare_qat_for_load_weights
+ 
+@@ -285,7 +293,13 @@ class vLLMColocateWorkerExtension:
+             )
+         )
+ 
+-        if self._is_qat_model:
++        if self._is_edgerazor_qat:
++            from edgerazor.vllm import process_weights_after_loading
++
++            for model in self._iter_all_models():
++                processed = process_weights_after_loading(model)
++                logger.info("EdgeRazor: repacked %d layers after weight reload", processed)
++        elif self._is_qat_model:
+             # QAT (compressed-tensors): call process_weights_after_loading AFTER all buckets are received
+             from verl.utils.qat import manual_process_weights_after_loading
+ 
+diff --git a/verl/workers/rollout/vllm_rollout/vllm_async_server.py b/verl/workers/rollout/vllm_rollout/vllm_async_server.py
+index 068bab5b..d28d2253 100644
+--- a/verl/workers/rollout/vllm_rollout/vllm_async_server.py
++++ b/verl/workers/rollout/vllm_rollout/vllm_async_server.py
+@@ -894,8 +894,19 @@ class vLLMHttpServer:
+             from verl.utils.qat import QATConfig, load_quantization_config
+ 
+             qat_config = QATConfig(**qat_config_dict)
+-            quantization_config_dict = load_quantization_config(qat_config)
+-            quant_method = quantization_config_dict.get("quant_method", None)
++            qat_backend = getattr(qat_config, "backend", "nvfp4")
++            if qat_backend == "edgerazor":
++                from verl.utils.qat.edgerazor import build_vllm_quantization_config, register_vllm_plugin
++
++                register_vllm_plugin()
++                quantization_config_dict = build_vllm_quantization_config(qat_config)
++                quant_method = "edgerazor"
++                quantization = "edgerazor"
++            elif qat_backend == "nvfp4":
++                quantization_config_dict = load_quantization_config(qat_config)
++                quant_method = quantization_config_dict.get("quant_method", None)
++            else:
++                raise ValueError(f"Unsupported QAT backend: {qat_backend}")
+ 
+             if quant_method == "modelopt":
+                 from verl.utils.modelopt import apply_modelopt_nvfp4_patches
+@@ -907,6 +918,8 @@ class vLLMHttpServer:
+ 
+                 apply_qat_patches()
+                 quantization = "compressed-tensors"
++            elif quant_method == "edgerazor":
++                pass
+             else:
+                 raise ValueError(f"Unsupported quant_method: {quant_method}")
+ 
+diff --git a/verl/workers/utils/losses.py b/verl/workers/utils/losses.py
+index c865b9dd..2d1f1463 100644
+--- a/verl/workers/utils/losses.py
++++ b/verl/workers/utils/losses.py
+@@ -54,7 +54,13 @@ def sft_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None)
+     return loss, {}
+ 
+ 
+-def ppo_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None):
++def ppo_loss(
++    config: ActorConfig,
++    model_output,
++    data: TensorDict,
++    dp_group=None,
++    policy_gradient_coef: float = 1.0,
++):
+     """Computes ppo loss from model output (log_prob, entropy, values, etc. ) and old_log_probs from data."""
+     log_prob = no_padding_2_padding(model_output["log_probs"], data)
+     entropy = model_output.get("entropy", None)
+@@ -117,7 +123,8 @@ def ppo_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None)
+ 
+     metrics.update(pg_metrics)
+     metrics["actor/pg_loss"] = Metric(value=pg_loss, aggregation=metric_aggregation)
+-    policy_loss = pg_loss
++    policy_loss = pg_loss * policy_gradient_coef
++    metrics["actor/pg_loss_coef"] = policy_gradient_coef
+ 
+     # add entropy loss
+     if entropy is not None:

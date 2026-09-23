@@ -1,0 +1,31 @@
+# W2.79-A8 QAT for Qwen3. KV cache quantization is intentionally disabled.
+qat_configuration:
+  method: QAT
+  select:
+    target_types:
+      - linear
+      - embedding
+    target_names: []
+    exclude_types: []
+    exclude_names: []
+  function:
+    epsilon: 1.0e-05
+    weight_function: weight_quant_uniform_symmetric_clip_per_block_mp_int1_58_int4_static_row_wise_sparse
+    w_scale_factor: 2.0
+    w_block_size: 256
+    w_mixed_precision_prop: 0.50
+    is_w_quantized: false
+    activation_function: state_quant_uniform_symmetric_absmax_per_block_int8
+    a_block_size: 256
+    kv_cache_function: null
+    kv_block_size: -1
+  overrides:
+    - name: model.embed_tokens
+      weight_function: weight_quant_uniform_symmetric_absmax_per_block_int4
+      w_scale_factor: -1
+      w_mixed_precision_prop: -1
+    - name: lm_head
+      weight_function: weight_quant_uniform_symmetric_absmax_per_block_int4
+      w_scale_factor: -1
+      w_mixed_precision_prop: -1
+  training: all

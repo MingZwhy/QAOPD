@@ -1,0 +1,8 @@
+{%- for message in messages %}
+    {{- '<|im_start|>' + message.role + '\n' + message.content + '<|im_end|>\n' }}
+{%- endfor %}
+{%- if add_generation_prompt %}
+    {%- set user_content = messages[-1].content %}
+    {%- set function_stub = user_content.split('```python\n', 1)[1].rsplit('\n```', 1)[0] + '\n' %}
+    {{- '<|im_start|>assistant\n<think>\n\n</think>\n\nHere is the completed function:\n```python\n' + function_stub }}
+{%- endif %}

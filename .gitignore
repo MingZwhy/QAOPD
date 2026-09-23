@@ -1,0 +1,18 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venvs/
+models/
+# Pools are built or fetched, never committed. Matching data/* rather than
+# data/*/ also covers a symlinked pool, which git does not see as a directory.
+data/*
+!data/*.py
+!data/README.md
+runs/
+experiments/
+outputs/
+logs/
+wandb/
+*.log
+.DS_Store
