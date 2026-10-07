@@ -5,11 +5,12 @@ Two artifact forms exist and they are not interchangeable.
 **Latent / trainable checkpoint.** BF16 master weights, with quantization
 re-applied at training or rollout time. This is what QAD writes and what OPD
 resumes from and produces. Use it to continue training and for the code
-evaluations.
+evaluations in `b1_test448.sh` and `b1_humaneval.sh`.
 
 **Deployment export.** Low-bit weights baked in, plus EdgeRazor runtime
 metadata. Produced by the export step in `opd/launch/evaluate_opd_qad_w279a8.sh`.
-Use it for lm-eval mathematics and QA, and for serving.
+Use it for lm-eval mathematics and QA, for code through `code_export.sh`, and
+for serving.
 
 ## Why this matters
 

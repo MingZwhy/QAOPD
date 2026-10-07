@@ -10,6 +10,7 @@ QAOPD_ROOT="${QAOPD_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}"
 ROOT="${ROOT:-$QAOPD_ROOT}"
 VERL="${VERL:-$QAOPD_ROOT/third_party/verl}"
 export VERL_ROOT="$VERL"
+export PYTHONPATH="$QAOPD_ROOT/third_party/edgerazor/src:$VERL:${PYTHONPATH:-}"
 export MODELS_DIR="${MODELS_DIR:-$QAOPD_ROOT/models}"
 export DATA_ROOT="${DATA_ROOT:-$QAOPD_ROOT/data}"
 STAMP=$(date -u +%Y%m%d_%H%M%S)
@@ -40,6 +41,13 @@ case "$MODEL_SIZE" in
     4b) DEF_STEPS=120 ;;
     *)  DEF_STEPS=80  ;;
 esac
+# REFRESH=1: 30 steps at lr 1e-6, started from a code checkpoint.
+REFRESH=${REFRESH:-0}
+DEF_LR=3e-6
+if [[ "$REFRESH" == 1 ]]; then
+    DEF_STEPS=30
+    DEF_LR=1e-6
+fi
 STEPS=${STEPS:-$DEF_STEPS}
 
 # QAT starting point. Fetch it with tools/fetch_weights.sh (it lives on the
@@ -55,8 +63,18 @@ if [[ ! -f "$STUDENT_MODEL/model.safetensors" \
     echo "no weights at $STUDENT_MODEL -- run: bash tools/fetch_weights.sh" >&2
     exit 1
 fi
-export TEACHER_MODEL=${TEACHER_MODEL_PATH:-$QAOPD_ROOT/models/Qwen3-1.7B}
+# Each student's own BF16 weights, except Qwen3-0.6B, which learns from Qwen3-1.7B.
+case "$MODEL_SIZE" in
+    4b) DEF_TEACHER=Qwen3-4B ;;
+    *)  DEF_TEACHER=Qwen3-1.7B ;;
+esac
+export TEACHER_MODEL=${TEACHER_MODEL_PATH:-$QAOPD_ROOT/models/$DEF_TEACHER}
 DATA=${DATA:-$QAOPD_ROOT/data/unified_math_v1}
+# The models are loaded inside Ray workers, which do not run in this directory, and a
+# relative path there is taken for a Hub repo id.
+STUDENT_MODEL=$(cd "$STUDENT_MODEL" && pwd) || exit 1
+[[ -d "$TEACHER_MODEL" ]] && TEACHER_MODEL=$(cd "$TEACHER_MODEL" && pwd)
+[[ -d "$DATA" ]] && DATA=$(cd "$DATA" && pwd)
 export TRAIN_FILE=$DATA/train.parquet
 export VAL_FILE=$DATA/validation.parquet
 export REWARD_FUNCTION_PATH=${REWARD_FUNCTION_PATH:-$QAOPD_ROOT/opd/rewards/math_mixed_reward.py}
@@ -77,7 +95,7 @@ export USE_TASK_REWARDS=True
 # points, see docs/OPD_1_7B.md. But that was luck, not design.)
 export DISTILLATION_TOPK=${DISTILLATION_TOPK:-32}
 export DISTILLATION_LOSS_COEF=${DISTILLATION_LOSS_COEF:-1.0}
-export ACTOR_LR=${ACTOR_LR:-3e-6}
+export ACTOR_LR=${ACTOR_LR:-$DEF_LR}
 export TRAINING_STEPS=$STEPS
 export SAVE_FREQ=${SAVE_FREQ:-10}
 export TEST_FREQ=100000
@@ -102,6 +120,9 @@ case "${MODEL_SIZE:-06b}" in
     4b) DEF_STU=4; DEF_TEA=4 ;;
     *)  DEF_STU=2; DEF_TEA=2 ;;
 esac
+if [[ "$REFRESH" == 1 && "$MODEL_SIZE" == 06b ]]; then
+    DEF_STU=1; DEF_TEA=1
+fi
 export STUDENT_NGPUS=${STUDENT_NGPUS:-$DEF_STU}
 export TEACHER_WORLD_SIZE=${TEACHER_WORLD_SIZE:-$DEF_TEA}
 export TOTAL_GPUS_PER_NODE=${TOTAL_GPUS_PER_NODE:-$((STUDENT_NGPUS + TEACHER_WORLD_SIZE))}
@@ -150,7 +171,7 @@ _show() {
 echo "  resolved recipe -- MODEL_SIZE=$MODEL_SIZE  BITWIDTH=$BITWIDTH"
 _show STEPS                     "$DEF_STEPS"
 _show SAVE_FREQ                 10
-_show ACTOR_LR                  3e-6
+_show ACTOR_LR                  "$DEF_LR"
 _show STUDENT_NGPUS             "$DEF_STU"
 _show TEACHER_WORLD_SIZE        "$DEF_TEA"
 _show TRAIN_BATCH_SIZE          8
@@ -172,7 +193,11 @@ if (( ${#_off_recipe[@]} )); then
 fi
 
 export PROJECT_NAME=opd_qad_unified
-export EXPERIMENT_NAME=${EXPERIMENT_NAME:-UNIFIED_math_k1_t17_lr3e6_s${STEPS}_${STAMP}}
+if [[ "$REFRESH" == 1 ]]; then
+    export EXPERIMENT_NAME=${EXPERIMENT_NAME:-UNIFIED_refresh_lr1e6_s${STEPS}_${STAMP}}
+else
+    export EXPERIMENT_NAME=${EXPERIMENT_NAME:-UNIFIED_math_k1_t17_lr3e6_s${STEPS}_${STAMP}}
+fi
 export OUTPUT_DIR=${OUTPUT_DIR:-${RUNS_DIR:-$QAOPD_ROOT/runs}/$EXPERIMENT_NAME}
 export WANDB_MODE=${WANDB_MODE:-offline}
 
@@ -195,10 +220,12 @@ fi
 export ATTN_IMPL
 
 # EXTRA_OVERRIDES lets a caller append hydra overrides; it expands to nothing by
-# default. It exists because the 4B student OOMs on a 72 GB card and needs
-# actor_rollout_ref.actor.fsdp_config.optimizer_offload=True,
-# and that override string used to be hardcoded with no injection point.
-# Deliberately unquoted: word splitting is what turns it into separate args.
+# default. Deliberately unquoted: word splitting is what turns it into separate args.
+# The 4B student OOMs on a 72 GB card unless the optimizer state is offloaded, so the
+# 4B arms get that override first.
+if [[ "$MODEL_SIZE" == 4b ]]; then
+    EXTRA_OVERRIDES="actor_rollout_ref.actor.fsdp_config.optimizer_offload=True ${EXTRA_OVERRIDES:-}"
+fi
 echo "UNIFIED math OPD: data=$(basename $DATA) steps=$STEPS resp=$MAX_RESPONSE_LENGTH attn=$ATTN_IMPL${EXTRA_OVERRIDES:+ extra=$EXTRA_OVERRIDES}"
 export TRAIN_SCRIPT=$QAOPD_ROOT/opd/launch/run_opd_qad_w279a8_qwen3_06b.sh
 PLAIN_TEXT_CHAT_TEMPLATE="{% for message in messages %}{{ message.content }}{% endfor %}"

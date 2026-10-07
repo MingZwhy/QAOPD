@@ -67,24 +67,50 @@ early, well inside the budget.
 ```bash
 BITWIDTH=w2.79 \
 STUDENT_MODEL=<the phase-1 checkpoint you picked> \
+EXPERIMENT_NAME=p2_w279 \
 bash scripts/opd/run_code.sh
 ```
 
-With no `STUDENT_MODEL` set this falls back to the highest-numbered checkpoint
-of the newest run, which is a convenience, not a selection — pass the
-checkpoint you picked.
+The student samples G=4 completions per prompt from a pool of Python problems,
+each a function stub with a docstring. The BF16 teacher scores the sampled
+tokens, and its top-64 log-probabilities give a forward-KL target applied as a
+direct gradient on every token; a GRPO term adds the verifier's verdict, 1 when
+the completion passes every test of its problem and 0 otherwise. One optimizer
+update per step, `clip_ratio_high=0.28`, a constant learning rate, prompts
+truncated at 1024 tokens and completions at 512, a checkpoint every 50 steps.
 
-Two code pools ship, and `CODE_VARIANT` chooses between them:
+The pools come from OpenCoder's educational_instruct subset, KodCode-V1 and the
+MBPP official *train* split, and `data/build_code_pools.py` builds them — see
+[`data/README.md`](../data/README.md). The 448 MBPP test rows and HumanEval are
+used for evaluation only.
 
-| `CODE_VARIANT` | pool |
-| --- | --- |
-| `mbpp_official_k1_t17_strict_lr3e6_s30` (default) | the MBPP official *train* split |
-| `kodcode_k1_t17_strict_lr3e6_s30` | KodCode, the wider pool — build it first, see [`data/README.md`](../data/README.md) |
+The rest is per arm, and `run_code.sh` resolves it from the student's
+`hidden_size` and `BITWIDTH`:
 
-Either way the 448 MBPP test rows stay out of training and are used for
-evaluation only. Learning rate 3e-6, 4 prompts per optimizer step, G=4, 140
-steps saving every 20. The optimum on this phase is often early, around step
-20 to 40, so scan rather than taking the endpoint.
+| Student | Width | Stages: pool, steps, learning rate | Prompts per step | Student+teacher GPUs | Teacher |
+| --- | --- | --- | --- | --- | --- |
+| Qwen3-0.6B | W2.79 | `code_opd_12k`, 300, 3e-6 | 32 | 1+1 | Qwen3-1.7B |
+| Qwen3-0.6B | W1.88 | `code_opd_24k`, 600, 3e-6 | 32 | 2+1 | Qwen3-1.7B |
+| Qwen3-1.7B | both | `code_opd_16k`, 300, 3e-6 → `code_opd_18k`, 300, 1e-6 | 32 | 4+1 | Qwen3-1.7B |
+| Qwen3-4B | W2.79 | `code_opd_24k`, 300, 3e-6 | 32 | 4+1 | Qwen3-4B |
+| Qwen3-4B | W1.88 | `code_opd_24k`, 300, 3e-6 | 64 | 4+1 | Qwen3-4B |
+
+The Qwen3-1.7B arm runs two stages: the second starts from the last checkpoint
+of the first and trains, at a third of the learning rate, on problems the first
+never saw. It writes to `runs/$EXPERIMENT_NAME`, and the first stage to
+`runs/${EXPERIMENT_NAME}_stage1`. The 4B arms offload the optimizer state, which
+the script adds on its own, and each arm fixes its seed (`SEED`; the data order
+follows from it).
+
+Report the last checkpoint of the last stage. The intermediate ones are for the
+validation curve on MBPP's 82-row validation split, not for picking a point on a
+test set.
+
+As in phase 1, everything takes an override — `STEPS` sets the length of every
+stage (useful for a short trial), `CODE_STAGES=pool:steps:lr,...` replaces the
+stage list, and `SEED`, `STUDENT_NGPUS` and `TRAIN_BATCH_SIZE` do what they say.
+The script prints the resolved recipe and names anything that differs from it;
+`STRICT_RECIPE=1` makes that an error.
 
 ## Bit widths
 

@@ -69,8 +69,8 @@ Install first; after that pick whichever row answers your question.
 | **1** | [Install](#1--install) — two environments, patched dependencies | ~1 h |
 | **2** | [Evaluate the released weights](#2--evaluate-the-released-weights) — reproduce the table above from the Hub | ~2 h |
 | **3a** | [Train the whole chain](#3a--the-whole-chain-from-bf16) — BF16 → QAD → OPD | days |
-| **3b** | [Reproduce OPD phase 1](#3b--reproduce-opd-phase-1-from-our-qad-checkpoint) — from our QAD checkpoint; the step this paper is about | ~4 h |
-| **3c** | [Add the code stage](#3c--add-the-code-stage) — MBPP, held-out test rows | hours |
+| **3b** | [Reproduce OPD phase 1](#3b--reproduce-opd-phase-1-from-our-qad-checkpoint) — from our QAD checkpoint; the step this paper is about | hours |
+| **3c** | [Add the code stage](#3c--add-the-code-stage) — from your phase-1 checkpoint, on Python problems with unit tests | hours |
 
 You can run 3b to reproduce the paper's core result relatively quickly: it
 trains the step the method is about, starting from a checkpoint you download
@@ -167,23 +167,25 @@ throughout.
 This is the claim, isolated: on-policy supervision recovering the long-form
 reasoning QAD left behind. Phase 1 is that step, it runs on its own, and the
 checkpoint each arm forked from is published — so stage 1 becomes a download.
-Four commands, a few hours on 4 GPUs.
+Four commands; for Qwen3-4B, phase 1 trains on 8 GPUs.
+
+Commands for Qwen3-0.6B and Qwen3-1.7B: [docs/REPRODUCE.md](docs/REPRODUCE.md#qwen3-06b-and-qwen3-17b).
 
 ```bash
 # 1 · the starting point — latent, so do not evaluate it directly
-bash tools/fetch_weights.sh qwen3_1_7b_w2.79 --qad
+bash tools/fetch_weights.sh qwen3_4b_w2.79 --qad
 
 # 2 · train. Steps, GPU split and memory budget resolve per arm from the
 #     student's config; the script prints what it picked
-BITWIDTH=w2.79 STUDENT_MODEL=models/qwen3_1_7b_w2.79_qad \
+BITWIDTH=w2.79 STUDENT_MODEL=models/qwen3_4b_w2.79_qad \
 EXPERIMENT_NAME=p1_w279 bash scripts/opd/run_math.sh
 
 # 3 · score the last checkpoint
-BITWIDTH=w2.79 RUN=runs/p1_w279 STEP=80 TAG=p1 \
+BITWIDTH=w2.79 RUN=runs/p1_w279 STEP=120 TAG=p1 \
 bash scripts/eval/eval_unified.sh
 
 # 4 · check general ability held, on the export step 3 left behind
-MODEL=experiments/opd_qad/unieval_p1_s80/model_w279a8kv16 \
+MODEL=experiments/opd_qad/unieval_p1_s120/model_w279a8kv16 \
 TAG=p1 GPUS=0,1 bash scripts/eval/qa_suite.sh
 ```
 
@@ -199,10 +201,41 @@ range of them if you want to pick rather than take the endpoint.
 
 #### 3c · Add the code stage
 
-Phase 2 continues from a phase-1 checkpoint on KodCode and MBPP's official
-*train* split, to restore the quantized model's coding ability —
-[`scripts/opd/run_code.sh`](scripts/opd/run_code.sh), documented in
-[docs/OPD.md](docs/OPD.md#phase-2--code).
+Phase 2 picks up the phase-1 checkpoint from 3b and turns the same on-policy
+supervision onto code: Python problems from OpenCoder and KodCode-V1 plus MBPP's
+official *train* split, each completion checked against its problem's unit
+tests. Four steps again. `STEPS=150` is enough for a quick check; `STEPS=300`
+recovers more of the coding ability and is what we recommend.
+
+Commands for Qwen3-0.6B and Qwen3-1.7B: [docs/REPRODUCE.md](docs/REPRODUCE.md#qwen3-06b-and-qwen3-17b).
+
+```bash
+# 1 · the code pools, rebuilt from the problem lists in data/code_pools/
+#     (needs data/mbpp_official_protocol_v1, stage 0 of docs/REPRODUCE.md)
+python data/build_code_pools.py
+
+# 2 · train from the phase-1 checkpoint. Pools, stages, steps and GPU split
+#     resolve per arm from the student's config; the script prints what it picked
+BITWIDTH=w2.79 STEPS=300 \
+STUDENT_MODEL=runs/p1_w279/checkpoints/global_step_120/actor/huggingface \
+EXPERIMENT_NAME=p2_w279 bash scripts/opd/run_code.sh
+
+# 3 · score code on the last checkpoint -- the latent one, since both scripts
+#     apply the quantization themselves
+BITWIDTH=w2.79 EXP_DIR=runs/p2_w279 STEPS=300 GPU=0 bash scripts/eval/b1_test448.sh
+BITWIDTH=w2.79 EXP_DIR=runs/p2_w279 STEPS=300 GPU=1 bash scripts/eval/b1_humaneval.sh
+
+# 4 · check that the mathematics from phase 1 held; RUN_AMC=0 leaves out the
+#     multi-hour AMC23 avg@16
+BITWIDTH=w2.79 RUN=runs/p2_w279 STEP=300 TAG=p2 RUN_AMC=0 \
+bash scripts/eval/eval_unified.sh
+```
+
+Compare MBPP and HumanEval against the checkpoint you started from — step 3
+with `EXP_DIR=runs/p1_w279 STEPS=120` scores it — and GSM8K / MATH-500 against
+step 3 of 3b. The other arms differ in pool, length, batch and GPU count
+([docs/OPD.md](docs/OPD.md#phase-2--code) has the table), and `run_code.sh`
+reads them off the student.
 
 ---
 

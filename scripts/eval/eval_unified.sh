@@ -29,13 +29,9 @@ GPU=${GPU:-0}
 # wrong bit width and no error (docs/CHECKPOINTS.md).
 source "$QAOPD_ROOT/scripts/lib/bitwidth.sh"; bitwidth_setup || exit 1
 MODEL_LABEL=${MODEL_LABEL:-${BW_LABEL}a8kv16}
-# The exporter copies tokenizer assets (incl. chat_template.jinja) from the QAT
-# source; the shipped warm checkpoints carry them.
 export LM_EVAL_INCLUDE_PATH="${LM_EVAL_INCLUDE_PATH:-$QAOPD_ROOT/eval_tasks}"
-export EVAL_TOKENIZER_SOURCE="${EVAL_TOKENIZER_SOURCE:-$QAOPD_ROOT/models/$BW_WARM}"
-[[ -d "$EVAL_TOKENIZER_SOURCE" ]] || { echo "no tokenizer source at $EVAL_TOKENIZER_SOURCE" >&2; exit 1; }
-# Usual call is RUN=<run-dir> STEP=<n>. CKPT= names a checkpoint directly, which
-# is how the warm QAT baseline (no run dir, no global_step_*) gets evaluated.
+# Usual call is RUN=<run-dir> STEP=<n>. CKPT= names a checkpoint directly: the warm
+# QAT baseline (no run dir, no global_step_*) or a released deployment export.
 if [[ -n "${CKPT:-}" ]]; then
     STEP=${STEP:-warm}
 else
@@ -53,6 +49,18 @@ fi
 # exports once and then runs the QA suite and this script against the same
 # directory). Without it every caller re-quantizes the same checkpoint.
 EXPORT_DIR=${EXPORT_DIR:-}
+RESTORE_EVAL_TOKENIZER=${RESTORE_EVAL_TOKENIZER:-1}
+# A deployment export (the released -QAOPD weights) is scored as it is: exporting it
+# again would re-quantize rounded weights, and it already carries the evaluation
+# tokenizer. Same test as opd/tools/validate_qat_latent_checkpoint.py.
+IS_EXPORT=$("$PY" - "$QAOPD_ROOT/opd/tools" "$CKPT" <<'PY'
+import sys
+from pathlib import Path
+sys.path.insert(0, sys.argv[1])
+from validate_qat_latent_checkpoint import find_prequantized_evidence
+print(1 if find_prequantized_evidence(Path(sys.argv[2])) else 0)
+PY
+) || exit 1
 if [[ -n "$EXPORT_DIR" ]]; then
     [[ -f "$EXPORT_DIR/model_$MODEL_LABEL/config.json" ]] || {
         echo "EXPORT_DIR has no model_$MODEL_LABEL/config.json: $EXPORT_DIR" >&2; exit 1; }
@@ -61,11 +69,33 @@ if [[ -n "$EXPORT_DIR" ]]; then
     # Stale result files from an earlier eval of this same export would be picked
     # up by the find below and reported as this run's numbers.
     find "$OUT" -name 'results*.json' -delete 2>/dev/null
+elif [[ "$IS_EXPORT" == 1 ]]; then
+    OUT=$ROOT/experiments/opd_qad/unieval_${TAG:-x}_s$STEP
+    rm -rf "$OUT"
+    mkdir -p "$OUT" && ln -s "$(cd "$CKPT" && pwd)" "$OUT/model_$MODEL_LABEL" || exit 1
+    CONVERT=0
+    RESTORE_EVAL_TOKENIZER=0
 else
     OUT=$ROOT/experiments/opd_qad/unieval_${TAG:-x}_s$STEP
     CONVERT=1
     rm -rf "$OUT"
 fi
+# Exporting a latent checkpoint copies tokenizer assets (incl. chat_template.jinja)
+# from a QAT start, which all carry the same ones -- as do the released exports --
+# so any that tools/fetch_weights.sh put in models/ will do when the warm one is not
+# there.
+if [[ "$RESTORE_EVAL_TOKENIZER" == 1 && -z "${EVAL_TOKENIZER_SOURCE:-}" ]]; then
+    EVAL_TOKENIZER_SOURCE=$QAOPD_ROOT/models/$BW_WARM
+    if [[ ! -d "$EVAL_TOKENIZER_SOURCE" ]]; then
+        for d in "$QAOPD_ROOT"/models/qwen3_*_qad "$QAOPD_ROOT"/models/qwen3_*_qaopd; do
+            [[ -f "$d/chat_template.jinja" ]] && { EVAL_TOKENIZER_SOURCE=$d; break; }
+        done
+    fi
+    [[ -d "$EVAL_TOKENIZER_SOURCE" ]] || {
+        echo "no tokenizer source at $EVAL_TOKENIZER_SOURCE -- fetch a QAD start" \
+             "(bash tools/fetch_weights.sh <arm> --qad) or set EVAL_TOKENIZER_SOURCE" >&2; exit 1; }
+fi
+export EVAL_TOKENIZER_SOURCE=${EVAL_TOKENIZER_SOURCE:-} RESTORE_EVAL_TOKENIZER
 # experiments/ is gitignored, so on a fresh clone this directory does not exist
 # and the `> "$OUT.log"` redirect below fails before the eval ever starts -- the
 # script then falls through to UNIEVAL_DONE having measured nothing.

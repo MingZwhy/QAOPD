@@ -6,6 +6,7 @@
 | AMC23 | `scripts/eval/amc23_avg16_parallel.sh` | avg@16 over 40 problems |
 | MBPP | `scripts/eval/b1_test448.sh` | pass@1, deterministic, 448 held-out problems |
 | HumanEval | `scripts/eval/b1_humaneval.sh` | pass@1, deterministic, 164 problems |
+| MBPP, HumanEval | `scripts/eval/code_export.sh` | the same two, on a deployment export |
 | QA9 | `scripts/eval/qa_suite.sh` | likelihood-scored multiple choice, 9 benchmarks |
 | BF16 reference | `scripts/eval/fp_ceiling.sh` | the unquantized ceiling for retention |
 
@@ -24,9 +25,11 @@ for a like-for-like comparison against it.
 
 ## Which artifact to evaluate
 
-Mathematics and QA run on a **deployment export**; code runs on the
-**trainable (latent) checkpoint** with quantization re-applied. This is not
-interchangeable — see [CHECKPOINTS.md](CHECKPOINTS.md).
+Mathematics and QA run on a **deployment export**. Code runs on either form:
+`b1_test448.sh` and `b1_humaneval.sh` take the **trainable (latent)
+checkpoint** and quantize it themselves, and `code_export.sh` takes the export.
+The forms are not interchangeable, and each code script declines the other —
+see [CHECKPOINTS.md](CHECKPOINTS.md).
 
 ## Reading the output
 

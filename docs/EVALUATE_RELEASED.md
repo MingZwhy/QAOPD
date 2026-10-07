@@ -1,8 +1,8 @@
 # Evaluate the released weights
 
 The fastest path: download a recovered checkpoint and score it. No training,
-no corpus to build. Expect about two hours for one model across every
-benchmark, most of it MBPP and HumanEval.
+no corpus to build. Expect under two hours for one model across every
+benchmark.
 
 Prerequisite: [INSTALL.md](INSTALL.md), through `bootstrap.sh`.
 
@@ -71,9 +71,10 @@ MODEL=$CKPT TAG=q17_w279 GPUS=0,1,2,3 bash scripts/eval/qa_suite.sh
 **Code** — MBPP on the held-out 448 and HumanEval-164, both greedy pass@1:
 
 ```bash
-bash scripts/eval/b1_test448.sh
-bash scripts/eval/b1_humaneval.sh
+bash scripts/eval/code_export.sh
 ```
+
+It decodes 32 problems at a time; lower `BATCH_SIZE` on a smaller card.
 
 ## 3 · Read the output
 
@@ -82,8 +83,8 @@ Each script prints a marker line with the score:
 ```
 UNIEVAL <tag> step<N> gsm8k: 0.5413
 UNIEVAL <tag> step<N> math500: 0.4960
-B1T448 step=<N> passed=233/448
-HE step=<N> passed=97/164
+CODE mbpp passed=233/448
+CODE humaneval passed=97/164
 QA_AVG tag=<tag> avg=51.81 over=9
 ```
 
@@ -99,8 +100,10 @@ reports a score.
 
 The values in the [results table](../README.md#results). Small deviations are
 normal across hardware and batch shape: in our own cross-machine checks the
-mathematics scores reproduced to the digit, and the code scores moved by one
-or two problems out of 448 and 164.
+mathematics scores reproduced to the digit. The code scores in the table were
+decoded with vLLM one problem at a time, while `code_export.sh` decodes with
+transformers in batches, and greedy decoding of a low-bit model is sensitive to
+that difference; expect the code scores within a few problems of the table.
 
 Two protocol details that move numbers more than hardware does:
 

@@ -48,16 +48,18 @@ export ROLLOUT_GPU_MEM_UTIL=${ROLLOUT_GPU_MEM_UTIL:-0.30}
 export ROLLOUT_MAX_NUM_SEQS=${ROLLOUT_MAX_NUM_SEQS:-256}
 export TEACHER_GPU_MEM_UTIL=${TEACHER_GPU_MEM_UTIL:-0.45}
 export LR_WARMUP_RATIO=0.0
-export DISTILLATION_LOSS_MODE=k1
-export DISTILLATION_TOPK=32
-export DISTILLATION_LOSS_COEF=1.0
-export USE_POLICY_GRADIENT=True
-export TRAINING_STEPS=30
-export SAVE_FREQ=5
-export TEST_FREQ=5
+# Overridable, so the configuration printed below and written to search_manifest.json is
+# the one that trains; scripts/opd/run_code.sh sets all of these.
+export DISTILLATION_LOSS_MODE=${DISTILLATION_LOSS_MODE:-k1}
+export DISTILLATION_TOPK=${DISTILLATION_TOPK:-32}
+export DISTILLATION_LOSS_COEF=${DISTILLATION_LOSS_COEF:-1.0}
+export USE_POLICY_GRADIENT=${USE_POLICY_GRADIENT:-True}
+export TRAINING_STEPS=${TRAINING_STEPS:-30}
+export SAVE_FREQ=${SAVE_FREQ:-5}
+export TEST_FREQ=${TEST_FREQ:-5}
 export VAL_BEFORE_TRAIN=True
 export LOG_VAL_GENERATIONS=8
-export MAX_ACTOR_CKPTS_TO_KEEP=6
+export MAX_ACTOR_CKPTS_TO_KEEP=${MAX_ACTOR_CKPTS_TO_KEEP:-6}
 export CHECKPOINT_SAVE_CONTENTS="['hf_model']"
 export RANDOM_SEED=${RANDOM_SEED:-42}
 export DATA_SEED=${DATA_SEED:-20260718}
@@ -78,10 +80,10 @@ case "$VARIANT" in
         # variant's reward and PG switches. A substituted pool must keep the 448
         # test rows out of training.
         export DATA_DIR=${DATA_DIR_OVERRIDE:-$DATA_ROOT/mbpp_official_protocol_v1}
-        export TEACHER_MODEL=$MODELS_DIR/Qwen3-1.7B
+        export TEACHER_MODEL=${TEACHER_MODEL:-$MODELS_DIR/Qwen3-1.7B}
         export USE_TASK_REWARDS=True
         export REQUIRE_ALL_TESTS=True
-        export ACTOR_LR=3e-6
+        export ACTOR_LR=${ACTOR_LR:-3e-6}
         export EVALUATION_TARGET="MBPP official validation selection and held-out official test"
         ;;
     kodcode_k1_t17_strict_lr3e6_s30)
@@ -91,10 +93,10 @@ case "$VARIANT" in
         # the 448 MBPP test rows.
         export DATA_VARIANT=kodcode
         export DATA_DIR=${DATA_DIR_OVERRIDE:-$DATA_ROOT/kodcode_v1}
-        export TEACHER_MODEL=$MODELS_DIR/Qwen3-1.7B
+        export TEACHER_MODEL=${TEACHER_MODEL:-$MODELS_DIR/Qwen3-1.7B}
         export USE_TASK_REWARDS=True
         export REQUIRE_ALL_TESTS=True
-        export ACTOR_LR=3e-6
+        export ACTOR_LR=${ACTOR_LR:-3e-6}
         export EVALUATION_TARGET="MBPP official validation selection and held-out official test"
         ;;
     *)
@@ -112,7 +114,7 @@ fi
 export EXPERIMENT_NAME=${EXPERIMENT_NAME:-w279a8kv16_code_${VARIANT}_${RUN_STAMP}}
 export OUTPUT_DIR=${OUTPUT_DIR:-$RUNS_DIR/$EXPERIMENT_NAME}
 
-echo "W2.79A8KV16 code OPD search configuration"
+echo "code OPD configuration (BITWIDTH=${BITWIDTH:-w2.79})"
 echo "  variant=$VARIANT"
 echo "  experiment_name=$EXPERIMENT_NAME"
 echo "  output_dir=$OUTPUT_DIR"

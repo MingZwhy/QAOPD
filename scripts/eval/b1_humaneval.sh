@@ -17,12 +17,16 @@ export VERL_ROOT="$VERL"
 # checkpoint and select the bit width explicitly.
 source "$QAOPD_ROOT/scripts/lib/bitwidth.sh"; bitwidth_setup || exit 1
 EXP_DIR=${EXP_DIR:?}; STEPS=${STEPS:?}; GPU=${GPU:-0}
+# The checkpoint is loaded inside Ray workers, which do not run in this directory,
+# and a relative path there is taken for a Hub repo id.
+EXP_DIR=$(cd "$EXP_DIR" && pwd) || exit 1
 SEL="$EXP_DIR/b1_humaneval"; mkdir -p "$SEL"
 
 for STEP in $STEPS; do
     [[ -s "$SEL/$STEP.jsonl" ]] && { echo "step $STEP done"; continue; }
     if [[ "$STEP" == warm ]]; then
         MODEL=${WARM_MODEL:-$QAOPD_ROOT/models/$BW_WARM}
+        [[ -d "$MODEL" ]] && MODEL=$(cd "$MODEL" && pwd)
     else
         MODEL="$EXP_DIR/checkpoints/global_step_$STEP/actor/huggingface"
     fi
@@ -34,9 +38,27 @@ for STEP in $STEPS; do
     # same checkpoints scored fine there and only HumanEval went missing.
     [[ -f "$MODEL/model.safetensors" || -f "$MODEL/model.safetensors.index.json" ]] \
         || { echo "HE step=$STEP no ckpt"; continue; }
+    # A deployment export would be quantized a second time here, which changes it.
+    if "$PY" - "$QAOPD_ROOT/opd/tools" "$MODEL" <<'PY'
+import sys
+from pathlib import Path
+sys.path.insert(0, sys.argv[1])
+from validate_qat_latent_checkpoint import find_prequantized_evidence
+sys.exit(0 if find_prequantized_evidence(Path(sys.argv[2])) else 1)
+PY
+    then
+        echo "HE step=$STEP $MODEL is a deployment export; score it with scripts/eval/code_export.sh"
+        continue
+    fi
+    # At the launcher's 0.70 a Qwen3-4B engine (hidden_size 2560) does not fit on a
+    # 72 GB card beside its fp32 actor.
+    MEM=${ROLLOUT_GPU_MEM_UTIL:-0.70}
+    if [[ -z "${ROLLOUT_GPU_MEM_UTIL:-}" ]] && grep -qE '"hidden_size": *2560' "$MODEL/config.json"; then
+        MEM=0.50
+    fi
     OUT="$EXP_DIR/evaluation_humaneval/b1g${GPU}_step_$STEP"
     mkdir -p "$EXP_DIR/evaluation_humaneval"; rm -rf "$OUT"
-    CUDA_VISIBLE_DEVICES=$GPU RAY_TMPDIR=/tmp/ray_heg${GPU}_$STEP \
+    CUDA_VISIBLE_DEVICES=$GPU RAY_TMPDIR=/tmp/ray_heg${GPU}_$STEP ROLLOUT_GPU_MEM_UTIL=$MEM \
     STUDENT_MODEL="$MODEL" MODEL_LABEL="b1he_step_$STEP" OUTPUT_DIR="$OUT" \
     DATA_DIR=${HUMANEVAL_EVAL_DIR:-$QAOPD_ROOT/data/humaneval_eval} \
     EVAL_SPLIT=validation EXPECTED_ROWS=164 ROLLOUT_MAX_NUM_SEQS=1 WANDB_MODE=offline \

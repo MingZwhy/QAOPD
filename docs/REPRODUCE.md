@@ -8,7 +8,7 @@ This is days of GPU time. If you only want the numbers, start at
 BF16 model
    └─ QAD          6,400–12,800 steps      44–124 h on 8 GPUs
         └─ OPD ①   mathematics, ~80 steps   a few hours on 2 GPUs
-             └─ OPD ②  code, ~120 steps     a few hours on 2 GPUs
+             └─ OPD ②  code, ~300 steps     a few hours on 2–5 GPUs
                   └─ evaluate
 ```
 
@@ -31,6 +31,7 @@ python data/filter_dapo_teacher.py
 python data/build_math_chat_pool.py
 python opd/data_prep/prepare_mbpp_official_protocol.py \
     --prepared_dir <raw mbpp> --output_dir data/mbpp_official_protocol_v1
+python data/build_code_pools.py
 python data/build_humaneval_eval.py
 ```
 
@@ -110,12 +111,16 @@ BITWIDTH=w2.79 STUDENT_MODEL=models/w279_qad bash scripts/opd/run_math.sh
 ```bash
 BITWIDTH=w2.79 \
 STUDENT_MODEL=<the phase-1 checkpoint you picked> \
-STEPS=120 \
+EXPERIMENT_NAME=p2_w279 \
 bash scripts/opd/run_code.sh
 ```
 
-Trains on the MBPP official *train* split; the 448 test rows stay held out.
-Learning rate 3e-6, 4 prompts per step, G=4.
+Trains on the code pools from stage 0 — OpenCoder and KodCode-V1 problems plus
+the MBPP official *train* split; the 448 test rows stay held out. Pool, stages,
+steps, batch and GPU split resolve per arm from the student
+([OPD.md](OPD.md#phase-2--code) has the table). `STEPS=150` is enough for a
+quick check; a longer run recovers more and is the one we recommend.
+The last stage's final checkpoint is the result.
 
 More on both stages in [OPD.md](OPD.md).
 
@@ -129,11 +134,43 @@ your OPD output is a **latent** checkpoint, so
 
 - mathematics and QA run on a **deployment export**; `eval_unified.sh`
   produces one for you from a latent checkpoint,
-- the code evaluations run on the **latent** checkpoint directly, because they
-  re-apply quantization themselves.
+- `b1_test448.sh` and `b1_humaneval.sh` run on the **latent** checkpoint
+  directly, because they apply quantization themselves. They decline an
+  export; `code_export.sh` scores one with the same protocol.
 
-Feeding an export to the code scripts double-quantizes and reports a wrong
-number without erroring. [CHECKPOINTS.md](CHECKPOINTS.md) has the guard rails.
+[CHECKPOINTS.md](CHECKPOINTS.md) has the guard rails.
+
+---
+
+## Qwen3-0.6B and Qwen3-1.7B
+
+README 3b and 3c walk Qwen3-4B. The other two sizes run the same steps from their
+own QAD start, with the BF16 Qwen3-1.7B in `models/Qwen3-1.7B` as the teacher;
+phase 1 ends at step 80 on both.
+
+```bash
+# Qwen3-0.6B, W2.79
+bash tools/fetch_weights.sh qwen3_06b_w2.79 --qad
+BITWIDTH=w2.79 STUDENT_MODEL=models/qwen3_06b_w2.79_qad \
+EXPERIMENT_NAME=p1_06b bash scripts/opd/run_math.sh
+BITWIDTH=w2.79 STEPS=300 \
+STUDENT_MODEL=runs/p1_06b/checkpoints/global_step_80/actor/huggingface \
+EXPERIMENT_NAME=p2_06b bash scripts/opd/run_code.sh
+```
+
+```bash
+# Qwen3-1.7B, W2.79
+bash tools/fetch_weights.sh qwen3_1_7b_w2.79 --qad
+BITWIDTH=w2.79 STUDENT_MODEL=models/qwen3_1_7b_w2.79_qad \
+EXPERIMENT_NAME=p1_17b bash scripts/opd/run_math.sh
+BITWIDTH=w2.79 STEPS=300 \
+STUDENT_MODEL=runs/p1_17b/checkpoints/global_step_80/actor/huggingface \
+EXPERIMENT_NAME=p2_17b bash scripts/opd/run_code.sh
+```
+
+Score them with the evaluation commands of README 3b and 3c, pointed at these
+runs (`STEP=80` for phase 1, `STEPS=300` for code). For W1.88, set
+`BITWIDTH=w1.88` and fetch the `_w1.88` arm.
 
 ---
 

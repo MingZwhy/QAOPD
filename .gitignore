@@ -9,6 +9,7 @@ models/
 data/*
 !data/*.py
 !data/README.md
+!data/code_pools/
 runs/
 experiments/
 outputs/
