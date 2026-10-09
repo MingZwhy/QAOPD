@@ -280,6 +280,9 @@ docs/             everything below
 
 ## Third-party code
 
+This work draws on [EdgeRazor](https://github.com/zhangsq-nju/EdgeRazor). We
+thank its authors for releasing it.
+
 `third_party/verl` and `third_party/edgerazor` are pinned submodules of the
 upstream projects, both Apache-2.0. Our changes live in
 `third_party/patches/` and are applied by `setup/bootstrap.sh`. See
