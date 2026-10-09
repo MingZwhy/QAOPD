@@ -1,6 +1,6 @@
 <div align="center">
 
-# QAOPD
+# <img src="docs/figures/naiwa.jpg" alt="" height="60" align="center"> QAOPD
 
 **On-Policy Distillation for Low-Bit Reasoning**
 
