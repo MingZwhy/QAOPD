@@ -119,6 +119,28 @@ by decaying to the endpoint. `run_qad.sh` rejects any other scheduler: the
 trainer always passes `min_lr`, which only `constant_with_warmup` and
 `cosine_with_min_lr` tolerate.
 
+### Gradient accumulation with a custom loss
+
+The patched `EdgeRazorTrainer` explicitly sets
+`model_accepts_loss_kwargs=False`. Its `compute_loss` returns a microbatch mean
+and does not use `num_items_in_batch`. Without the flag, Transformers 4.57 can
+inherit the Qwen model's `**kwargs` capability and skip the division by the
+number of accumulation steps. That scales gradients and logged Trainer loss
+by the accumulation factor before clipping.
+
+This is a correctness fix, not a speed optimization. If you resume a checkpoint
+made with the old behavior, record the transition: it does not retroactively
+correct earlier updates, and the Trainer loss curve will change scale.
+
+The CPU regression exercises the actual Trainer `training_step`, captures the
+DeepSpeed backward adapter, and compares one batch against two and four
+accumulated microbatches. It does not launch a distributed job:
+
+```bash
+CUDA_VISIBLE_DEVICES='' venvs/qaopd-eval/bin/python -m unittest discover \
+  -s tests -p test_qad_gradient_accumulation.py -v
+```
+
 ### Per arm
 
 | `COMBO` | steps | epochs | save every | keep |
