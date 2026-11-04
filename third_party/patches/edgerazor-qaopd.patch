@@ -253,7 +253,18 @@ diff --git a/example/edgerazor-llm/src/trainer.py b/example/edgerazor-llm/src/tr
 index 4e0118d..bcc5bc6 100644
 --- a/example/edgerazor-llm/src/trainer.py
 +++ b/example/edgerazor-llm/src/trainer.py
-@@ -51,6 +51,9 @@ class EdgeRazorTrainer(Trainer):
+@@ -45,6 +45,10 @@ class EdgeRazorTrainer(Trainer):
+             optimizers=optimizers,
+             preprocess_logits_for_metrics=preprocess_logits_for_metrics,
+         )
++        # compute_loss returns a microbatch mean and ignores num_items_in_batch.
++        # Do not inherit the student's **kwargs capability: Trainer must divide
++        # this custom loss by gradient_accumulation_steps before backward.
++        self.model_accepts_loss_kwargs = False
+         self.teacher_model = teacher_model
+         self.router_aux_loss_coef = router_aux_loss_coef
+         self.router_z_loss_coef = router_z_loss_coef
+@@ -51,6 +55,9 @@ class EdgeRazorTrainer(Trainer):
          self.edgerazor = edgerazor
          
          self.custom_losses = {}
@@ -263,7 +274,7 @@ index 4e0118d..bcc5bc6 100644
      
      def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
          # inputs contains: input_ids, attention_mask, labels
-@@ -118,8 +121,22 @@ class EdgeRazorTrainer(Trainer):
+@@ -118,8 +125,22 @@ class EdgeRazorTrainer(Trainer):
                  'train/router_z_loss': router_z_loss.item() if isinstance(router_z_loss, torch.Tensor) else router_z_loss,
              })
          
