@@ -1,0 +1,72 @@
+{
+  "model": "Qwen3-1.7B W2.79",
+  "gpu": "NVIDIA A800-SXM4-80GB",
+  "sequence_length": 1024,
+  "microbatch": 6,
+  "microbatches_per_timing_group": 32,
+  "sequences_per_timing_group": 192,
+  "precision": "native DeepSpeed BF16, no outer autocast",
+  "timing_scope": "forward and backward only; optimizer and cross-GPU communication excluded",
+  "synchronization": "group boundary",
+  "warmup_groups": 1,
+  "measured_groups": 3,
+  "timing_summary": {
+    "baseline": {
+      "sequences_per_group": 192,
+      "microbatches_per_group": 32,
+      "median_seconds_per_group": 45.770581281976774,
+      "numerical_equivalence_passed": true,
+      "diagnostic_only": false,
+      "sequences_per_second": 4.194834206215433,
+      "peak_allocated_bytes": 45034088448,
+      "peak_reserved_bytes": 68371349504,
+      "speedup_vs_baseline": 1
+    },
+    "cache_teacher": {
+      "sequences_per_group": 192,
+      "microbatches_per_group": 32,
+      "median_seconds_per_group": 38.86082289891783,
+      "numerical_equivalence_passed": true,
+      "diagnostic_only": false,
+      "sequences_per_second": 4.940708551113741,
+      "peak_allocated_bytes": 48392676864,
+      "peak_reserved_bytes": 68371349504,
+      "speedup_vs_baseline": 1.1778078246318187
+    },
+    "cache_teacher_no_checkpoint_fused_sparse_kd_linear": {
+      "sequences_per_group": 192,
+      "microbatches_per_group": 32,
+      "median_seconds_per_group": 26.303493507090025,
+      "numerical_equivalence_passed": true,
+      "diagnostic_only": false,
+      "sequences_per_second": 7.299410625750036,
+      "peak_allocated_bytes": 59794931200,
+      "peak_reserved_bytes": 68371349504,
+      "speedup_vs_baseline": 1.7400951424813382
+    },
+    "cache_teacher_no_checkpoint_fused_sparse_kd_linear_sparse_ce": {
+      "sequences_per_group": 192,
+      "microbatches_per_group": 32,
+      "median_seconds_per_group": 25.992514349985868,
+      "numerical_equivalence_passed": true,
+      "diagnostic_only": false,
+      "sequences_per_second": 7.38674209869598,
+      "peak_allocated_bytes": 57795933184,
+      "peak_reserved_bytes": 68371349504,
+      "speedup_vs_baseline": 1.7609139564446046
+    }
+  },
+  "gradient_check": {
+    "status": "PASS",
+    "full_parameter_gradients_compared": true,
+    "elements": 1720574976,
+    "bitwise_identical": true,
+    "relative_l2_error": 0,
+    "max_absolute_error": 0,
+    "loss_max_absolute_error": 0,
+    "microbatch": 6,
+    "accumulation": 2,
+    "largest_relative_mismatches": []
+  },
+  "packaging_note": "Measurements predate this PR packaging. Core compute implementations were copied from that reproduction; the packaged launcher still needs a GPU rerun. No multi-GPU equivalence or held-out-quality claim."
+}

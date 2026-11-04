@@ -165,6 +165,92 @@ quantizer config is the one that matters most: the two widths differ by a
 single field, and training the wrong one produces a healthy-looking checkpoint
 of the wrong model.
 
+## Optional compute fastpath (experimental)
+
+QAD spends a fair amount of time repeating weight quantization across
+microbatches and evaluating vocabulary losses at positions that are masked
+out. There is an opt-in implementation for **Qwen3-1.7B W2.79**:
+
+```bash
+QAOPD_QAD_FASTPATH=1 \
+COMBO=qwen3_1_7b_w2.79 MODEL=models/Qwen3-1.7B \
+bash scripts/qad/run_qad.sh
+```
+
+The default launcher still uses the original trainer. The opt-in entrypoint
+caches quantized weights within an optimizer step, drops the unused teacher
+CE/KV cache, and skips ignored vocabulary rows in KD and task CE. It keeps
+gradient checkpointing enabled. Weights are invalidated at step boundaries,
+training entry/exit and resume; the caches are detached and never enter the
+state dict. Changes to model methods and global KD functions are restored when
+the entrypoint exits.
+
+For the full configuration used in the A800 reproduction, also set
+`QAOPD_QAD_NO_CHECKPOINT=1`. This trades activation memory for less recomputation
+and enables the fused BF16 activation quantizer and linear-layer STE. The
+quantizer retains the native BF16 intermediate rounding; unsupported tensor
+shapes and dtypes fall back to the native operations. Its CUDA rounding
+fixtures run before training. This configuration needs more memory, so it is
+not the default.
+
+Each feature can be disabled independently with a `0` flag:
+
+| Flag | Default with fastpath enabled |
+|---|---|
+| `QAOPD_QAD_WEIGHT_CACHE` | `1` |
+| `QAOPD_QAD_SPARSE_KD` | `1` |
+| `QAOPD_QAD_SPARSE_CE` | `1` |
+| `QAOPD_QAD_NO_CHECKPOINT` | `0` |
+| `QAOPD_QAD_FUSED_QUANT` | follows `NO_CHECKPOINT` |
+| `QAOPD_QAD_FUSED_LINEAR` | follows `FUSED_QUANT` |
+
+Fused quantization currently requires disabling checkpointing; fused linear
+also requires weight caching. Other model/width combinations are rejected
+rather than implicitly opting them into a configuration we have not checked.
+The fastpath does not change the microbatch, accumulation, dataset, loss
+coefficients, sequence length, schedule, quantization widths or training budget.
+It does set `model_accepts_loss_kwargs=False`: the custom objective returns a
+microbatch mean and does not consume `num_items_in_batch`. Record that scaling
+correction when comparing with a checkpoint from an unpatched trainer.
+
+### Measurements and validation limits
+
+Single A800-SXM4-80GB, real Qwen3-1.7B checkpoint at step 300, BF16,
+microbatch 6, sequence length 1024, 32 microbatches (192 sequences) per group.
+The median uses three measured groups after one warmup group:
+
+| Compute configuration | Seconds / group | Relative throughput |
+|---|---:|---:|
+| Native baseline | 45.77 | 1.00x |
+| Weight cache + teacher cleanup | 38.86 | 1.18x |
+| Also disable recomputation, fuse quantization/STE, mask KD | 26.30 | 1.74x |
+| Also mask task CE | 25.99 | 1.76x |
+
+These are forward/backward measurements; they exclude optimizer updates and
+cross-GPU communication. The full configuration's peak allocated memory in
+this fixture was about 53.8 GiB, against 41.9 GiB for the baseline.
+The companion A800 check compared all 1,720,574,976 parameter gradient elements
+at microbatch 6 and accumulation 2 and found bitwise equality, including the
+total loss. [Recorded measurements](benchmarks/qad-fastpath-a800.json).
+
+Those measurements were collected in the reproduction before this PR was
+packaged. The core compute implementations are carried over here; the new
+launcher integration still needs a GPU rerun. A separate four-A800 run of that
+reproduction was around 28.6 seconds/update, versus roughly 49–50 for an earlier
+baseline run. That is a cross-run observation, not a controlled distributed
+comparison. Full distributed optimizer-state equivalence, other model sizes
+and widths, and final held-out quality remain unverified.
+
+CPU tests cover native loss/gradient equivalence, ignored labels, confidence
+weighting, three consecutive weight updates, cache cleanup and the non-CUDA
+quantizer fallback. After bootstrap:
+
+```bash
+CUDA_VISIBLE_DEVICES='' venvs/qaopd-eval/bin/python -m unittest discover -s tests -v
+# On a GPU allocated to you, explicitly enable CUDA rounding fixtures:
+QAOPD_TEST_CUDA=1 venvs/qaopd-eval/bin/python -m unittest discover -s tests -v
+```
+
 ## Choosing the checkpoint to hand to OPD
 
 Save frequently and **do not assume the training endpoint is the best starting
