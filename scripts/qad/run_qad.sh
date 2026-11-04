@@ -22,6 +22,19 @@ QAOPD_ROOT="${QAOPD_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}"
 cd "$QAOPD_ROOT" || exit 1
 
 COMBO=${COMBO:?set COMBO, e.g. qwen3_1_7b_w2.79 (a stem under configs/qad/)}
+QAD_ENTRY=main.py
+case "${QAOPD_QAD_FASTPATH:-0}" in
+    0) ;;
+    1)
+        [[ "$COMBO" == qwen3_1_7b_w2.79 ]] || {
+            echo "QAD fastpath is currently checked only on qwen3_1_7b_w2.79" >&2
+            exit 2
+        }
+        QAD_ENTRY="$QAOPD_ROOT/tools/qad_fastpath_entry.py"
+        ;;
+    *) echo "QAOPD_QAD_FASTPATH must be 0 or 1" >&2; exit 2 ;;
+esac
+export COMBO
 MODEL=${MODEL:?set MODEL to the FP base model dir (teacher and student both)}
 WORKSPACE=${WORKSPACE:-$QAOPD_ROOT/runs/qad_workspace}
 NGPU=${NGPU:-8}
@@ -198,7 +211,7 @@ cd "$ER_SRC" || exit 1
 # 0-7 and only 8-15 are yours. Verified by probing torch.cuda uuid per rank.
 PYTHONPATH="$QAOPD_ROOT/third_party/edgerazor/src:${PYTHONPATH:-}" \
 TOKENIZERS_PARALLELISM=false HF_HUB_OFFLINE=1 \
-"$E/bin/deepspeed" --include "localhost:$GPUS" main.py > "$LOG" 2>&1
+"$E/bin/deepspeed" --include "localhost:$GPUS" "$QAD_ENTRY" > "$LOG" 2>&1
 RC=$?
 kill $HB_PID 2>/dev/null; rm -f "$HEARTBEAT"
 if [[ $RC -ne 0 ]]; then
